@@ -1,0 +1,8 @@
+*.o
+*log
+Makefile.configure
+config.h
+sheepwool
+pid-file
+.ccls-cache
+*.old
