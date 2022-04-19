@@ -33,7 +33,6 @@ static void http_open(struct kreq *r, enum khttp code, char *mime) {
   khttp_head(r, "X-Content-Type-Options", "nosniff");
   khttp_head(r, "X-Frame-Options", "DENY");
   khttp_head(r, "X-XSS-Protection", "1; mode=block");
-  khttp_body(r);
 }
 
 static int serve(struct database *db) {
@@ -55,32 +54,55 @@ static int serve(struct database *db) {
     int rc = load_resource(db, &res, req.fullpath);
     if (rc == SQLITE_NOTFOUND) {
       http_open(&req, KHTTP_404, (char *)"text/plain");
+      khttp_body(&req);
       khttp_free(&req);
       continue;
     } else if (rc != SQLITE_OK) {
       fprintf(stderr, "Failed loading resource %s: %s\n", req.fullpath,
               db->err_msg);
       http_open(&req, KHTTP_500, (char *)"text/plain");
+      khttp_body(&req);
       khttp_free(&req);
       continue;
     }
 
-    const char *scheme = req.scheme == KSCHEME_HTTPS ? "https" : "http";
-    res.baseurl = sqlite3_mprintf("%s://%s", scheme, req.host);
+    enum khttp status;
 
-    rc = render_resource(db, &res, &req);
-    if (rc) {
-      fprintf(stderr, "Failed rendering resource %s\n", req.fullpath);
-      http_open(&req, KHTTP_500, (char *)"text/plain");
-      free_resource(&res);
-      khttp_free(&req);
-      continue;
+    if (res.status == MOVED) {
+      status = KHTTP_301;
+      res.mime = sqlite3_mprintf("text/plain");
+      res.content = sqlite3_mprintf("Moved to %s", res.moved_to);
+      res.size = strlen(res.content);
+    } else if (res.status == GONE) {
+      status = KHTTP_410;
+      res.mime = sqlite3_mprintf("text/plain");
+      res.content = sqlite3_mprintf("No longer exists");
+      res.size = strlen(res.content);
+    } else {
+      status = KHTTP_200;
+      const char *scheme = req.scheme == KSCHEME_HTTPS ? "https" : "http";
+      res.baseurl = sqlite3_mprintf("%s://%s", scheme, req.host);
+
+      rc = render_resource(db, &res, &req);
+      if (rc) {
+        fprintf(stderr, "Failed rendering resource %s\n", req.fullpath);
+        http_open(&req, KHTTP_500, (char *)"text/plain");
+        khttp_body(&req);
+        khttp_free(&req);
+        free_resource(&res);
+        continue;
+      }
     }
 
-    http_open(&req, KHTTP_200, (char *)res.mime);
+    http_open(&req, status, res.mime);
+    if (res.moved_to != NULL) {
+      khttp_head(&req, "Location", "%s", res.moved_to);
+    }
+
+    khttp_body(&req);
     khttp_write(&req, res.content, res.size);
-    free_resource(&res);
     khttp_free(&req);
+    free_resource(&res);
   }
 
   khttp_fcgi_free(fcgi);

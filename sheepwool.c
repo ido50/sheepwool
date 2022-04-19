@@ -421,6 +421,99 @@ static int parse_scss(lua_State *L, struct resource *res, char *abspath) {
   return 0;
 }
 
+static void remove_newline(char *input) {
+  char *pch = strstr(input, "\n");
+  if (pch != NULL)
+    strncpy(pch, "\0", 1);
+}
+
+static int import_meta(lua_State *L, struct database *db, char *abspath) {
+  sqlite3_stmt *stmt;
+  int rc = sqlite3_prepare_v2(db->conn,
+                              "REPLACE INTO resources(slug, status, moved_to)"
+                              "      VALUES (?, ?, ?)",
+                              -1, &stmt, NULL);
+  if (rc != SQLITE_OK) {
+    db->err_code = rc;
+    db->err_msg = sqlite3_errmsg(db->conn);
+    sqlite3_finalize(stmt);
+    return rc;
+  }
+
+  FILE *fd = fopen(abspath, "r");
+  if (fd == NULL) {
+    perror("Failed opening file");
+    return errno;
+  }
+
+  char *line = NULL;
+  size_t len = 0;
+  while (getline(&line, &len, fd) != -1) {
+    char *token = strtok(line, " ");
+    int i = 0;
+    while (token) {
+      remove_newline(token);
+      switch (i) {
+      case 0:
+        rc = sqlite3_bind_text(stmt, 1, token, -1, NULL);
+        break;
+      case 1:
+        if (strcmp(token, "permanent") == 0) {
+          rc = sqlite3_bind_int(stmt, 2, MOVED);
+        } else if (strcmp(token, "gone") == 0) {
+          rc = sqlite3_bind_int(stmt, 2, GONE);
+        } else if (strcmp(token, "not_found") == 0) {
+          rc = sqlite3_bind_int(stmt, 2, UNPUB);
+        } else {
+          fprintf(stderr, "META: invalid status %s in line %s\n", token, line);
+          sqlite3_finalize(stmt);
+          free(line);
+          return 1;
+        }
+        break;
+      case 2:
+        rc = sqlite3_bind_text(stmt, 3, token, -1, NULL);
+        break;
+      default:
+        fprintf(stderr, "META: invalid line %s\n", line);
+        sqlite3_finalize(stmt);
+        free(line);
+        return 1;
+      }
+
+      if (rc) {
+        db->err_code = rc;
+        db->err_msg = sqlite3_errmsg(db->conn);
+        free(line);
+        sqlite3_finalize(stmt);
+        return rc;
+      }
+
+      token = strtok(NULL, " ");
+      i++;
+    }
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+      db->err_code = rc;
+      db->err_msg = sqlite3_errmsg(db->conn);
+      free(line);
+      sqlite3_finalize(stmt);
+      return rc;
+    }
+
+    sqlite3_reset(stmt);
+  }
+
+  fclose(fd);
+  if (line)
+    free(line);
+
+  sqlite3_finalize(stmt);
+
+  return 0;
+}
+
 static int import_file(lua_State *L, struct database *db, char *root,
                        char *abspath, char *relpath, struct stat fstat) {
   struct resource res;
@@ -493,23 +586,23 @@ static int import_file(lua_State *L, struct database *db, char *root,
     return db->err_code;
   }
 
-  rc = execute(
-      db,
-      "INSERT OR REPLACE INTO resources "
-      "(slug, srcpath, mime, name, status, content, size, template, moved_to, "
-      " ctime, mtime) "
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      bind(SQLITE_TEXT, 0, 0, res.slug, 0),
-      bind(SQLITE_TEXT, 0, 0, res.srcpath, 0),
-      bind(SQLITE_TEXT, 0, 0, res.mime, 0),
-      bind(SQLITE_TEXT, 0, 0, res.name, 0),
-      bind(SQLITE_INTEGER, res.status, 0, NULL, 0),
-      bind(SQLITE_BLOB, 0, 0, res.content, res.size),
-      bind(SQLITE_INTEGER, res.size, 0, NULL, 0),
-      bind(SQLITE_TEXT, 0, 0, res.tmpl, 0),
-      bind(SQLITE_TEXT, 0, 0, res.moved_to, 0),
-      bind(SQLITE_TEXT, 0, 0, res.ctime, 0),
-      bind(SQLITE_TEXT, 0, 0, res.mtime, 0));
+  rc = execute(db,
+               "INSERT OR REPLACE INTO resources "
+               "(slug, srcpath, mime, name, status, content, size, template, "
+               "moved_to, "
+               " ctime, mtime) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               bind(SQLITE_TEXT, 0, 0, res.slug, 0),
+               bind(SQLITE_TEXT, 0, 0, res.srcpath, 0),
+               bind(SQLITE_TEXT, 0, 0, res.mime, 0),
+               bind(SQLITE_TEXT, 0, 0, res.name, 0),
+               bind(SQLITE_INTEGER, res.status, 0, NULL, 0),
+               bind(SQLITE_BLOB, 0, 0, res.content, res.size),
+               bind(SQLITE_INTEGER, res.size, 0, NULL, 0),
+               bind(SQLITE_TEXT, 0, 0, res.tmpl, 0),
+               bind(SQLITE_TEXT, 0, 0, res.moved_to, 0),
+               bind(SQLITE_TEXT, 0, 0, res.ctime, 0),
+               bind(SQLITE_TEXT, 0, 0, res.mtime, 0));
   if (rc != SQLITE_OK) {
     printf("Failed inserting to database: %s\n", db->err_msg);
     execute(db, "ROLLBACK");
@@ -603,7 +696,12 @@ static int build_dir(lua_State *L, struct database *db, char *root,
       }
     } else if (S_ISREG(fstat.st_mode) || entry->d_type == DT_REG) {
       lua_pop(L, lua_gettop(L));
-      rc = import_file(L, db, root, absfilepath, relfilepath, fstat);
+
+      if (relpath == NULL && strcmp(relfilepath, "/META") == 0) {
+        rc = import_meta(L, db, absfilepath);
+      } else {
+        rc = import_file(L, db, root, absfilepath, relfilepath, fstat);
+      }
       if (rc) {
         perror("Failed importing file");
         sqlite3_free(relfilepath);
@@ -1031,32 +1129,20 @@ int render_resource(struct database *db, struct resource *res,
 }
 
 void free_resource(struct resource *res) {
-  /*printf("Freeing resource %s\n", res->slug);*/
-  /*printf("\tFreeing slug\n");*/
   sqlite3_free(res->slug);
-  /*printf("\tFreeing srcpath\n");*/
   sqlite3_free(res->srcpath);
-  /*printf("\tFreeing name\n");*/
   sqlite3_free(res->name);
-  /*printf("\tFreeing mime\n");*/
   sqlite3_free(res->mime);
-  /*printf("\tFreeing content\n");*/
   sqlite3_free(res->content);
-  /*printf("\tFreeing tmpl\n");*/
   sqlite3_free(res->tmpl);
-  /*printf("\tFreeing moved_to\n");*/
   sqlite3_free(res->moved_to);
-  /*printf("\tFreeing ctime\n");*/
   sqlite3_free(res->ctime);
-  /*printf("\tFreeing mtime\n");*/
   sqlite3_free(res->mtime);
   for (int i = 0; i < MAX_TAGS; i++) {
     if (res->tags[i] == NULL) {
       break;
     }
-    /*printf("\tFreeing tags[%d]: %s\n", i, res->tags[i]);*/
     sqlite3_free(res->tags[i]);
   }
-  /*printf("\tFreeing baseurl\n");*/
   sqlite3_free(res->baseurl);
 }
