@@ -31,8 +31,8 @@ struct resource {
   char *tags[MAX_TAGS];
 };
 
-int connect(struct database *, char *, bool);
-int disconnect(struct database *);
+int sqlite_connect(struct database *, char *, bool);
+int sqlite_disconnect(struct database *);
 sqlite3_stmt *prepare(struct database *, const char *, ...);
 int execute(struct database *, const char *, ...);
 int init_rw(struct database *db);
@@ -53,5 +53,5 @@ struct bind_param {
   unsigned long size;
 };
 
-struct bind_param bind(int type, int int_value, double double_value,
-                       char *char_value, unsigned long size);
+struct bind_param sqlite_bind(int type, int int_value, double double_value,
+                              char *char_value, unsigned long size);

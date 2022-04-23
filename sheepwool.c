@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include <curl/curl.h>
 #include <kcgi.h>
 #include <lauxlib.h>
 #include <lua.h>
@@ -24,7 +25,7 @@
 #include "etlua.h"
 #include "sheepwool.h"
 
-int connect(struct database *db, char *dbpath, bool read_only) {
+int sqlite_connect(struct database *db, char *dbpath, bool read_only) {
   int rc =
       sqlite3_open_v2(dbpath, &db->conn,
                       read_only ? SQLITE_OPEN_READONLY
@@ -55,10 +56,10 @@ int connect(struct database *db, char *dbpath, bool read_only) {
   return SQLITE_OK;
 }
 
-int disconnect(struct database *db) { return sqlite3_close(db->conn); }
+int sqlite_disconnect(struct database *db) { return sqlite3_close(db->conn); }
 
-struct bind_param bind(int type, int int_value, double double_value,
-                       char *char_value, unsigned long size) {
+struct bind_param sqlite_bind(int type, int int_value, double double_value,
+                              char *char_value, unsigned long size) {
   struct bind_param p;
   p.type = type;
   p.int_value = int_value;
@@ -242,9 +243,10 @@ static void *get_nullable_blob(sqlite3_stmt *stmt, int col_num) {
     return NULL;
   }
 
+  const char *blob = sqlite3_column_blob(stmt, col_num);
   int blob_size = sqlite3_column_bytes(stmt, col_num);
   char *dest = sqlite3_malloc(blob_size);
-  memcpy(dest, sqlite3_column_blob(stmt, col_num), blob_size);
+  memcpy(dest, blob, blob_size);
 
   return dest;
 }
@@ -592,17 +594,17 @@ static int import_file(lua_State *L, struct database *db, char *root,
                "moved_to, "
                " ctime, mtime) "
                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               bind(SQLITE_TEXT, 0, 0, res.slug, 0),
-               bind(SQLITE_TEXT, 0, 0, res.srcpath, 0),
-               bind(SQLITE_TEXT, 0, 0, res.mime, 0),
-               bind(SQLITE_TEXT, 0, 0, res.name, 0),
-               bind(SQLITE_INTEGER, res.status, 0, NULL, 0),
-               bind(SQLITE_BLOB, 0, 0, res.content, res.size),
-               bind(SQLITE_INTEGER, res.size, 0, NULL, 0),
-               bind(SQLITE_TEXT, 0, 0, res.tmpl, 0),
-               bind(SQLITE_TEXT, 0, 0, res.moved_to, 0),
-               bind(SQLITE_TEXT, 0, 0, res.ctime, 0),
-               bind(SQLITE_TEXT, 0, 0, res.mtime, 0));
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.slug, 0),
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.srcpath, 0),
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.mime, 0),
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.name, 0),
+               sqlite_bind(SQLITE_INTEGER, res.status, 0, NULL, 0),
+               sqlite_bind(SQLITE_BLOB, 0, 0, res.content, res.size),
+               sqlite_bind(SQLITE_INTEGER, res.size, 0, NULL, 0),
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.tmpl, 0),
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.moved_to, 0),
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.ctime, 0),
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.mtime, 0));
   if (rc != SQLITE_OK) {
     printf("Failed inserting to database: %s\n", db->err_msg);
     execute(db, "ROLLBACK");
@@ -611,7 +613,7 @@ static int import_file(lua_State *L, struct database *db, char *root,
   }
 
   rc = execute(db, "DELETE FROM tags WHERE slug=?",
-               bind(SQLITE_TEXT, 0, 0, res.slug, 0));
+               sqlite_bind(SQLITE_TEXT, 0, 0, res.slug, 0));
   if (rc != SQLITE_OK) {
     printf("Failed removing existing tags: %s (%d)\n", db->err_msg,
            db->err_code);
@@ -626,8 +628,8 @@ static int import_file(lua_State *L, struct database *db, char *root,
     }
 
     rc = execute(db, "INSERT INTO tags VALUES (?, ?)",
-                 bind(SQLITE_TEXT, 0, 0, res.slug, 0),
-                 bind(SQLITE_TEXT, 0, 0, res.tags[i], 0));
+                 sqlite_bind(SQLITE_TEXT, 0, 0, res.slug, 0),
+                 sqlite_bind(SQLITE_TEXT, 0, 0, res.tags[i], 0));
     if (rc != SQLITE_OK) {
       printf("Failed inserting tag %d (%s): %s (%d)\n", i, res.tags[i],
              db->err_msg, db->err_code);
@@ -740,9 +742,10 @@ int load_resource(struct database *db, struct resource *res, char *slug) {
       "           group_concat(t.tag) AS tags"
       "      FROM resources r"
       " LEFT JOIN tags t ON t.slug = r.slug"
-      "     WHERE r.slug=?"
+      "     WHERE r.slug = ? AND r.status != ?"
       "  GROUP BY r.slug",
-      bind(SQLITE_TEXT, 0, 0, slug, 0));
+      sqlite_bind(SQLITE_TEXT, 0, 0, slug, 0),
+      sqlite_bind(SQLITE_INTEGER, UNPUB, 0, NULL, 0));
   if (stmt == NULL) {
     printf("Prepare failed: %s\n", db->err_msg);
     return SQLITE_ERROR;
@@ -797,6 +800,13 @@ static void pushtablestring(lua_State *L, const char *key, char *value) {
   lua_settable(L, -3);
 }
 
+static void pushtablelstring(lua_State *L, const char *key, char *value,
+                             int size) {
+  lua_pushstring(L, key);
+  lua_pushlstring(L, value, size);
+  lua_settable(L, -3);
+}
+
 static int open_etlua(lua_State *L) {
   if (luaL_loadstring(L, (const char *)etlua) != LUA_OK) {
     return lua_error(L);
@@ -827,24 +837,28 @@ static int lua_query(lua_State *L) {
 
   if (num_params > 0 && num_params < MAX_PARAMS) {
     for (int i = 0; i < num_params; i++) {
-      int si = i + 4;
+      int si = i + 3;
       switch (lua_type(L, si)) {
       case LUA_TSTRING:
-        params[i] = bind(SQLITE_TEXT, 0, 0, (char *)lua_tostring(L, si), 0);
+        params[i] =
+            sqlite_bind(SQLITE_TEXT, 0, 0, (char *)lua_tostring(L, si), 0);
         break;
       case LUA_TBOOLEAN:
-        params[i] = bind(SQLITE_INTEGER, lua_toboolean(L, si), 0, NULL, 0);
+        params[i] =
+            sqlite_bind(SQLITE_INTEGER, lua_toboolean(L, si), 0, NULL, 0);
         break;
       case LUA_TNUMBER:
         if (lua_isinteger(L, si)) {
-          params[i] = bind(SQLITE_INTEGER, lua_tointeger(L, si), 0, NULL, 0);
+          params[i] =
+              sqlite_bind(SQLITE_INTEGER, lua_tointeger(L, si), 0, NULL, 0);
           break;
         } else {
-          params[i] = bind(SQLITE_FLOAT, 0, lua_tonumber(L, si), NULL, 0);
+          params[i] =
+              sqlite_bind(SQLITE_FLOAT, 0, lua_tonumber(L, si), NULL, 0);
           break;
         }
       case LUA_TNIL:
-        params[i] = bind(SQLITE_NULL, 0, 0, NULL, 0);
+        params[i] = sqlite_bind(SQLITE_NULL, 0, 0, NULL, 0);
         break;
       }
     }
@@ -906,6 +920,44 @@ static int lua_query(lua_State *L) {
   return 1;
 }
 
+static int lua_post_request(lua_State *L) {
+  const char *url = luaL_checkstring(L, 1);
+  const char *body = luaL_checkstring(L, 3);
+
+  CURL *curl = curl_easy_init();
+  if (!curl) {
+    return luaL_error(L, "failed creating request: %d", errno);
+  }
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+
+  int num_headers = luaL_len(L, 2);
+  struct curl_slist *headers = NULL;
+  for (int i = 1; i <= num_headers; i++) {
+    lua_pushinteger(L, i);
+    lua_gettable(L, 2);
+    headers = curl_slist_append(headers, lua_tostring(L, -1));
+  }
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+  printf("Sending request\n");
+  CURLcode res = curl_easy_perform(curl);
+  if (res != CURLE_OK) {
+    lua_pushfstring(L, "failed request: %s", curl_easy_strerror(res));
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return lua_error(L);
+  }
+
+  printf("Request succeeded\n");
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+
+  return 1;
+}
+
 static int lua_render(lua_State *L) {
   struct database *db = (struct database *)lua_touserdata(L, 1);
   char *tmpl_name = sqlite3_mprintf("%s", lua_tostring(L, 2));
@@ -917,7 +969,7 @@ static int lua_render(lua_State *L) {
 
   sqlite3_stmt *stmt;
   int rc = sqlite3_prepare_v2(db->conn,
-                              "SELECT content, size, template"
+                              "SELECT content, template"
                               "  FROM resources"
                               " WHERE slug = ?",
                               -1, &stmt, NULL);
@@ -945,36 +997,43 @@ static int lua_render(lua_State *L) {
 
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
-      lua_pushfstring(L, "Failed loading template: %s",
+      lua_pushfstring(L, "Failed loading template %s: %s", tmpl_name,
                       sqlite3_errmsg(db->conn));
       sqlite3_finalize(stmt);
       return lua_error(L);
     }
 
-    char *tmpl = get_nullable_blob(stmt, 0);
-    if (tmpl == NULL) {
+    if (sqlite3_column_type(stmt, 0) == SQLITE_NULL) {
       sqlite3_finalize(stmt);
       return luaL_error(L, "failed getting template: content is NULL");
     }
 
-    int size = sqlite3_column_int(stmt, 1);
+    const void *tmpl = sqlite3_column_blob(stmt, 0);
+    int tmpl_size = sqlite3_column_bytes(stmt, 0);
+
+    lua_pushlstring(L, tmpl, tmpl_size);
+    // stack: [db, slug, context, etlua, render, template]
 
     sqlite3_free(tmpl_name);
-    tmpl_name = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 2));
-
-    lua_pushlstring(L, tmpl, size);
-    // stack: [db, slug, context, etlua, render, template]
+    tmpl_name = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 1));
 
     lua_pushnil(L);
     lua_copy(L, 3, 7);
     // stack: [db, slug, context, etlua, render, template, context]
 
     if (lua_pcall(L, 2, 1, 0) != LUA_OK) {
+      sqlite3_free(tmpl_name);
       sqlite3_finalize(stmt);
       return luaL_error(L, "failed rendering template: %s",
                         lua_tostring(L, -1));
     }
     // stack: [db, slug, context, etlua, output]
+
+    if (lua_isnil(L, -1)) {
+      sqlite3_free(tmpl_name);
+      sqlite3_finalize(stmt);
+      return luaL_error(L, "failed rendering template: got nil");
+    }
 
     if (strcmp(tmpl_name, "") != 0) {
       lua_setfield(L, 3, "content");
@@ -992,17 +1051,21 @@ static int lua_render(lua_State *L) {
   return 1;
 }
 
-static const struct luaL_Reg lua_lib[] = {
-    {"query", lua_query}, {"render", lua_render}, {NULL, NULL}};
+static const struct luaL_Reg lua_lib[] = {{"query", lua_query},
+                                          {"render", lua_render},
+                                          {"post", lua_post_request},
+                                          {NULL, NULL}};
 
 static int render_lua_resource(struct database *db, struct resource *res,
                                struct kreq *req) {
   lua_State *L = luaL_newstate();
   luaL_openlibs(L);
 
-  char content[res->size + 1];
-  strlcpy(content, res->content, res->size + 1);
-  int rc = luaL_dostring(L, content);
+  char lua_code[res->size + 1];
+  strlcpy(lua_code, res->content, res->size);
+  lua_code[res->size] = '\0';
+
+  int rc = luaL_dostring(L, lua_code);
   if (rc != LUA_OK) {
     fprintf(stderr, "Failed evaluating lua code: %s\n", lua_tostring(L, -1));
     lua_close(L);
@@ -1084,12 +1147,13 @@ static int render_html_resource(struct database *db, struct resource *res,
 
   lua_pushlightuserdata(L, db);
   lua_pushstring(L, res->tmpl);
-  lua_createtable(L, 0, 8);
+  lua_createtable(L, 0, 9);
+  pushtablestring(L, "reqpath", req->fullpath);
   pushtablestring(L, "baseurl", res->baseurl);
   pushtablestring(L, "slug", res->slug);
   pushtablestring(L, "srcpath", res->srcpath);
   pushtablestring(L, "name", res->name);
-  pushtablestring(L, "content", res->content);
+  pushtablelstring(L, "content", res->content, res->size);
   pushtablestring(L, "ctime", res->ctime);
   pushtablestring(L, "mtime", res->mtime);
   lua_pushliteral(L, "tags");

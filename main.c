@@ -43,32 +43,28 @@ static int serve(struct database *db) {
     return EXIT_FAILURE;
 
   while (khttp_fcgi_parse(fcgi, &req) == KCGI_OK) {
-    if (req.method != KMETHOD_GET && req.method != KMETHOD_HEAD) {
-      http_open(&req, KHTTP_405, (char *)"text/plain");
-      khttp_free(&req);
-      continue;
-    }
-
     struct resource res;
+    enum khttp status;
+    int errc = 0;
+
+    /*if (req.method != KMETHOD_GET && req.method != KMETHOD_HEAD) {*/
+    /*http_open(&req, KHTTP_405, (char *)"text/plain");*/
+    /*khttp_free(&req);*/
+    /*continue;*/
+    /*}*/
 
     int rc = load_resource(db, &res, req.fullpath);
     if (rc == SQLITE_NOTFOUND) {
-      http_open(&req, KHTTP_404, (char *)"text/plain");
-      khttp_body(&req);
-      khttp_free(&req);
-      continue;
+      status = KHTTP_404;
+      printf("Loading 404.html resource\n");
+      errc = load_resource(db, &res, (char *)"/404");
     } else if (rc != SQLITE_OK) {
       fprintf(stderr, "Failed loading resource %s: %s\n", req.fullpath,
               db->err_msg);
-      http_open(&req, KHTTP_500, (char *)"text/plain");
-      khttp_body(&req);
-      khttp_free(&req);
-      continue;
-    }
 
-    enum khttp status;
-
-    if (res.status == MOVED) {
+      status = KHTTP_500;
+      errc = load_resource(db, &res, (char *)"/500");
+    } else if (res.status == MOVED) {
       status = KHTTP_301;
       res.mime = sqlite3_mprintf("text/plain");
       res.content = sqlite3_mprintf("Moved to %s", res.moved_to);
@@ -80,18 +76,29 @@ static int serve(struct database *db) {
       res.size = strlen(res.content);
     } else {
       status = KHTTP_200;
-      const char *scheme = req.scheme == KSCHEME_HTTPS ? "https" : "http";
-      res.baseurl = sqlite3_mprintf("%s://%s", scheme, req.host);
+      res.baseurl = sqlite3_mprintf(
+          "%s://%s", req.scheme == KSCHEME_HTTPS ? "https" : "http", req.host);
+    }
 
-      rc = render_resource(db, &res, &req);
-      if (rc) {
-        fprintf(stderr, "Failed rendering resource %s\n", req.fullpath);
-        http_open(&req, KHTTP_500, (char *)"text/plain");
-        khttp_body(&req);
-        khttp_free(&req);
-        free_resource(&res);
-        continue;
+    if (errc == 0) {
+      errc = render_resource(db, &res, &req);
+      if (errc) {
+        status = KHTTP_500;
+        if (load_resource(db, &res, (char *)"/500") == 0)
+          errc = render_resource(db, &res, &req);
       }
+    }
+
+    if (errc) {
+      http_open(&req, status, (char *)"text/plain");
+      khttp_body(&req);
+      if (res.content == NULL || strcmp(res.content, "") == 0) {
+        khttp_puts(&req, khttps[status]);
+      } else {
+        khttp_puts(&req, res.content);
+      }
+      khttp_free(&req);
+      continue;
     }
 
     http_open(&req, status, res.mime);
@@ -127,7 +134,7 @@ int main(int argc, char **argv) {
   printf("dbpath: %s\n", dbpath);
 
   struct database db;
-  if (connect(&db, dbpath, false)) {
+  if (sqlite_connect(&db, dbpath, false)) {
     kutil_err(NULL, NULL, "Failed connecting to DB (%d): %s", db.err_code,
               db.err_msg);
     return EXIT_FAILURE;
@@ -139,7 +146,7 @@ int main(int argc, char **argv) {
     ret = serve(&db);
   }
 
-  disconnect(&db);
+  sqlite_disconnect(&db);
   sqlite3_free(dbpath);
   return ret;
 }

@@ -13,7 +13,7 @@ SRC             = $(wildcard *.c)
 SRC            += $(wildcard deps/*/*.c)
 OBJS            = $(SRC:.c=.o)
 
-DEPS_PKG        = sqlite3 kcgi lua libzstd libmagic libsass
+DEPS_PKG        = sqlite3 kcgi lua libzstd libmagic libsass libcurl
 STATIC_PKG     != [ -z "$(LDADD_STATIC)" ] || echo "--static"
 CFLAGS_PKG     != pkg-config --cflags $(DEPS_PKG)
 LDADD_PKG      != pkg-config --libs $(STATIC_PKG) $(DEPS_PKG)
