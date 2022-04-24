@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <curl/curl.h>
 #include <kcgi.h>
@@ -18,12 +19,13 @@
 #include <lua.h>
 #include <lualib.h>
 #include <magic.h>
-#include <sass.h>
+#include <sass/base.h>
+#include <sass/context.h>
 #include <sqlite3.h>
 
-#include "deps/strsplit/strsplit.h"
 #include "etlua.h"
 #include "sheepwool.h"
+#include "strsplit.h"
 
 int sqlite_connect(struct database *db, char *dbpath, bool read_only) {
   int rc =
@@ -37,6 +39,8 @@ int sqlite_connect(struct database *db, char *dbpath, bool read_only) {
     sqlite3_close(db->conn);
     return rc;
   }
+
+  sqlite3_busy_timeout(db->conn, 500);
 
   if (read_only) {
     rc = init_ro(db);
@@ -177,7 +181,7 @@ int init_rw(struct database *db) {
       "CREATE TABLE IF NOT EXISTS vars ("
       "    key             TEXT PRIMARY KEY,"
       "    value           ANY NOT NULL"
-      ") STRICT",
+      ")",
       "CREATE TABLE IF NOT EXISTS resources ("
       "    slug      TEXT PRIMARY KEY,"
       "    srcpath   TEXT,"
@@ -190,12 +194,12 @@ int init_rw(struct database *db) {
       "    moved_to  TEXT,"
       "    ctime     TEXT,"
       "    mtime     TEXT"
-      ") STRICT",
+      ")",
       "CREATE TABLE IF NOT EXISTS tags ("
       "    slug      TEXT NOT NULL,"
       "    tag       TEXT NOT NULL,"
       "    PRIMARY KEY (slug, tag)"
-      ") STRICT",
+      ")",
       "CREATE INDEX IF NOT EXISTS resource_status ON resources(status)",
       "COMMIT"};
 
@@ -249,31 +253,6 @@ static void *get_nullable_blob(sqlite3_stmt *stmt, int col_num) {
   memcpy(dest, blob, blob_size);
 
   return dest;
-}
-
-static void dumpstack(lua_State *L) {
-  int top = lua_gettop(L);
-  printf("Stack size is %d\n", top);
-  for (int i = 1; i <= top; i++) {
-    printf("%d\t%s\t", i, luaL_typename(L, i));
-    switch (lua_type(L, i)) {
-    case LUA_TNUMBER:
-      printf("%g\n", lua_tonumber(L, i));
-      break;
-    case LUA_TSTRING:
-      printf("%s\n", lua_tostring(L, i));
-      break;
-    case LUA_TBOOLEAN:
-      printf("%s\n", (lua_toboolean(L, i) ? "true" : "false"));
-      break;
-    case LUA_TNIL:
-      printf("%s\n", "nil");
-      break;
-    default:
-      printf("%p\n", lua_topointer(L, i));
-      break;
-    }
-  }
 }
 
 bool match(lua_State *L, char *str, const char *pattern) {
@@ -663,13 +642,20 @@ static int build_dir(lua_State *L, struct database *db, char *root,
     abspath = sqlite3_mprintf("%s/%s", root, relpath);
   }
 
-  printf("Working on directory %s\n", relpath);
+  printf("Working on directory %s\n", abspath);
 
   DIR *dir = opendir(abspath);
+  if (dir == NULL) {
+    perror("Failed opening directory");
+    return errno;
+  }
+
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     if (entry->d_name[0] == '.')
       continue;
+
+    printf("Working on entry %s\n", entry->d_name);
 
     char *absfilepath = sqlite3_mprintf("%s/%s", abspath, entry->d_name);
     char *relfilepath = sqlite3_mprintf("%s/%s", relpath, entry->d_name);
@@ -723,18 +709,202 @@ static int build_dir(lua_State *L, struct database *db, char *root,
   return 0;
 }
 
-int fsbuild(struct database *db, char *root) {
-  lua_State *L = luaL_newstate();
-  luaL_openlibs(L);
+#if HAVE_UNVEIL
+static int unveil_database(char *dbpath) {
+  if (unveil(dbpath, "rwc") == -1) {
+    perror("failed unveiling database");
+    return errno;
+  }
+
+  char *shmpath = sqlite3_mprintf("%s-shm", dbpath);
+  if (unveil(shmpath, "rwc") == -1) {
+    perror("failed unveiling database shm");
+    sqlite3_free(shmpath);
+    return errno;
+  }
+  sqlite3_free(shmpath);
+
+  char *walpath = sqlite3_mprintf("%s-wal", dbpath);
+  if (unveil(walpath, "rwc") == -1) {
+    perror("failed unveiling database wal");
+    sqlite3_free(walpath);
+    return errno;
+  }
+  sqlite3_free(walpath);
+
+  return 0;
+}
+#endif
+
+int fsbuild(char *dbpath, char *root) {
+#if HAVE_PLEDGE
+  if (pledge("stdio rpath wpath cpath flock fattr unveil", NULL) == -1) {
+    perror("Failed pledging");
+    return errno;
+  }
+#endif
+
+#if HAVE_UNVEIL
+  if (unveil_database(dbpath))
+    return 1;
+  if (unveil(root, "r") == -1) {
+    perror("Failed unveiling source directory");
+    return errno;
+  }
+  if (unveil("/usr/local/share/misc/magic.mgc", "r") == -1) {
+    perror("Failed unveiling magic database");
+    return errno;
+  }
+  if (unveil(NULL, NULL) == -1) {
+    perror("Failed closing unveil");
+    return errno;
+  }
+#endif
+
+  printf("Connecting to database\n");
+  struct database db;
+  if (sqlite_connect(&db, dbpath, false)) {
+    fprintf(stderr, "Failed connecting to database: %s\n", db.err_msg);
+    return EXIT_FAILURE;
+  }
 
   printf("Building database from %s\n", root);
-  int ret = build_dir(L, db, root, NULL);
+  lua_State *L = luaL_newstate();
+  luaL_openlibs(L);
+  int ret = build_dir(L, &db, root, NULL);
   lua_close(L);
+
+  sqlite_disconnect(&db);
 
   return ret;
 }
 
+static void http_open(struct kreq *r, enum khttp code, char *mime) {
+  khttp_head(r, kresps[KRESP_STATUS], "%s", khttps[code]);
+  khttp_head(r, kresps[KRESP_CONTENT_TYPE], "%s", mime);
+  khttp_head(r, "X-Content-Type-Options", "nosniff");
+  khttp_head(r, "X-Frame-Options", "DENY");
+  khttp_head(r, "X-XSS-Protection", "1; mode=block");
+}
+
+int serve(char *dbpath) {
+  struct kreq req;
+  struct kfcgi *fcgi;
+
+#if HAVE_PLEDGE
+  if (pledge("unix sendfd recvfd inet dns proc stdio flock rpath wpath cpath "
+             "fattr unveil",
+             NULL) == -1) {
+    perror("Failed pledging");
+    return errno;
+  }
+#endif
+#if HAVE_UNVEIL
+  if (unveil_database(dbpath)) {
+    perror("Failed unveiling database");
+    return 1;
+  }
+  if (unveil("/etc/ssl/cert.pem", "r") == -1) {
+    perror("Failed unveiling certificates");
+    return errno;
+  }
+  if (unveil(NULL, NULL) == -1) {
+    perror("Failed closing unveils");
+    return errno;
+  }
+#endif
+
+  struct database db;
+  if (sqlite_connect(&db, dbpath, false)) {
+    fprintf(stderr, "Failed connecting to database: %s", db.err_msg);
+    return EXIT_FAILURE;
+  }
+
+  if (khttp_fcgi_init(&fcgi, NULL, 0, NULL, 0, 0) != KCGI_OK)
+    return EXIT_FAILURE;
+
+#if HAVE_PLEDGE
+  if (pledge("stdio recvfd inet dns flock rpath wpath cpath fattr", NULL) ==
+      -1) {
+    perror("Failed pledging");
+    return errno;
+  }
+#endif
+
+  while (khttp_fcgi_parse(fcgi, &req) == KCGI_OK) {
+    struct resource res;
+    enum khttp status;
+    int errc = 0;
+
+    int rc = load_resource(&db, &res, req.fullpath);
+    if (rc == SQLITE_NOTFOUND) {
+      status = KHTTP_404;
+      errc = load_resource(&db, &res, (char *)"/404");
+    } else if (rc != SQLITE_OK) {
+      fprintf(stderr, "Failed loading resource %s: %s\n", req.fullpath,
+              db.err_msg);
+
+      status = KHTTP_500;
+      errc = load_resource(&db, &res, (char *)"/500");
+    } else if (res.status == MOVED) {
+      status = KHTTP_301;
+      res.mime = sqlite3_mprintf("text/plain");
+      res.content = sqlite3_mprintf("Moved to %s", res.moved_to);
+      res.size = strlen(res.content);
+    } else if (res.status == GONE) {
+      status = KHTTP_410;
+      res.mime = sqlite3_mprintf("text/plain");
+      res.content = sqlite3_mprintf("No longer exists");
+      res.size = strlen(res.content);
+    } else {
+      status = KHTTP_200;
+      res.baseurl = sqlite3_mprintf(
+          "%s://%s", req.scheme == KSCHEME_HTTPS ? "https" : "http", req.host);
+    }
+
+    if (errc == 0) {
+      errc = render_resource(&db, &res, &req);
+      if (errc) {
+        status = KHTTP_500;
+        if (load_resource(&db, &res, (char *)"/500") == 0)
+          errc = render_resource(&db, &res, &req);
+      }
+    }
+
+    if (errc) {
+      http_open(&req, status, (char *)"text/plain");
+      khttp_body(&req);
+      if (res.content == NULL || strcmp(res.content, "") == 0) {
+        khttp_puts(&req, khttps[status]);
+      } else {
+        khttp_puts(&req, res.content);
+      }
+      khttp_free(&req);
+      continue;
+    }
+
+    http_open(&req, status, res.mime);
+    if (res.moved_to != NULL) {
+      khttp_head(&req, "Location", "%s", res.moved_to);
+    }
+
+    khttp_body(&req);
+    khttp_write(&req, res.content, res.size);
+    khttp_free(&req);
+    free_resource(&res);
+  }
+
+  khttp_fcgi_free(fcgi);
+  sqlite_disconnect(&db);
+
+  return EXIT_SUCCESS;
+}
+
 int load_resource(struct database *db, struct resource *res, char *slug) {
+  char *sslug = strdup(slug);
+  if (strcmp(sslug, "") == 0)
+    sslug = strdup("/");
+
   sqlite3_stmt *stmt = prepare(
       db,
       "    SELECT r.slug, r.srcpath, r.name, r.mime, r.status, r.content,"
@@ -744,10 +914,11 @@ int load_resource(struct database *db, struct resource *res, char *slug) {
       " LEFT JOIN tags t ON t.slug = r.slug"
       "     WHERE r.slug = ? AND r.status != ?"
       "  GROUP BY r.slug",
-      sqlite_bind(SQLITE_TEXT, 0, 0, slug, 0),
+      sqlite_bind(SQLITE_TEXT, 0, 0, sslug, 0),
       sqlite_bind(SQLITE_INTEGER, UNPUB, 0, NULL, 0));
   if (stmt == NULL) {
     printf("Prepare failed: %s\n", db->err_msg);
+    free(sslug);
     return SQLITE_ERROR;
   }
 
@@ -758,6 +929,7 @@ int load_resource(struct database *db, struct resource *res, char *slug) {
       db->err_msg = sqlite3_errmsg(db->conn);
     }
 
+    free(sslug);
     sqlite3_finalize(stmt);
     return SQLITE_NOTFOUND;
   }
@@ -765,6 +937,7 @@ int load_resource(struct database *db, struct resource *res, char *slug) {
   res->slug = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 0));
 
   if (strcmp(res->slug, "") == 0) {
+    free(sslug);
     sqlite3_finalize(stmt);
     return SQLITE_NOTFOUND;
   }
@@ -789,6 +962,7 @@ int load_resource(struct database *db, struct resource *res, char *slug) {
     res->tags[i] = NULL;
   }
 
+  free(sslug);
   sqlite3_finalize(stmt);
 
   return SQLITE_OK;

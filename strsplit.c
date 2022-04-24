@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "strsplit.h"
-#include "strdup/strdup.h"
+#include "strdup.h"
 
 int
 strsplit (const char *str, char *parts[], const char *delimiter) {

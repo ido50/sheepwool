@@ -1,8 +1,8 @@
 #include <lua.h>
 #include <sqlite3.h>
-#include <stdarg.h>
 #include <stdbool.h>
-#include <sys/stat.h>
+
+struct kreq;
 
 #define MAX_TAGS 10
 #define MAX_PARAMS 100
@@ -37,7 +37,8 @@ sqlite3_stmt *prepare(struct database *, const char *, ...);
 int execute(struct database *, const char *, ...);
 int init_rw(struct database *db);
 int init_ro(struct database *db);
-int fsbuild(struct database *db, char *root);
+int fsbuild(char *dbpath, char *root);
+int serve(char *dbpath);
 bool match(lua_State *L, char *str, const char *pattern);
 char *replace(lua_State *L, char *str, const char *pattern, const char *repl);
 int load_resource(struct database *db, struct resource *res, char *slug);
