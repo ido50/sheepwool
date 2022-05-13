@@ -255,6 +255,126 @@ static void *get_nullable_blob(sqlite3_stmt *stmt, int col_num) {
   return dest;
 }
 
+static void pushtablestring(lua_State *L, const char *key, char *value) {
+  lua_pushstring(L, key);
+  lua_pushstring(L, value);
+  lua_settable(L, -3);
+}
+
+static void pushtablelstring(lua_State *L, const char *key, char *value,
+                             int size) {
+  lua_pushstring(L, key);
+  lua_pushlstring(L, value, size);
+  lua_settable(L, -3);
+}
+
+static void pushtableint(lua_State *L, const char *key, int value) {
+  lua_pushstring(L, key);
+  lua_pushinteger(L, value);
+  lua_settable(L, -3);
+}
+
+static int open_etlua(lua_State *L) {
+  if (luaL_loadstring(L, (const char *)etlua) != LUA_OK) {
+    return lua_error(L);
+  }
+  lua_call(L, 0, 1);
+  return 1;
+}
+
+static int lua_render(lua_State *L) {
+  // stack: [db, slug, context]
+
+  struct database *db = (struct database *)lua_touserdata(L, 1);
+  char *tmpl_name = sqlite3_mprintf("%s", lua_tostring(L, 2));
+
+  luaL_requiref(L, "etlua", open_etlua, 0);
+  // stack: [db, slug, context, etlua]
+
+  sqlite3_stmt *stmt;
+  int rc = sqlite3_prepare_v2(db->conn,
+                              "SELECT content, template"
+                              "  FROM resources"
+                              " WHERE slug = ?",
+                              -1, &stmt, NULL);
+  if (rc) {
+    lua_pushfstring(L, "Failed preparing template statement: %s",
+                    sqlite3_errmsg(db->conn));
+    sqlite3_finalize(stmt);
+    return lua_error(L);
+  }
+
+  while (true) {
+    if (lua_getfield(L, 4, "render") != LUA_TFUNCTION) {
+      return luaL_error(L, "failed getting render function: got %s",
+                        lua_typename(L, lua_type(L, -1)));
+    }
+    // stack: [db, slug, context, etlua, render]
+
+    rc = sqlite3_bind_text(stmt, 1, tmpl_name, -1, NULL);
+    if (rc) {
+      lua_pushfstring(L, "Failed binding template slug: %s",
+                      sqlite3_errmsg(db->conn));
+      sqlite3_finalize(stmt);
+      return lua_error(L);
+    }
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+      lua_pushfstring(L, "Failed loading template %s: %s", tmpl_name,
+                      sqlite3_errmsg(db->conn));
+      sqlite3_finalize(stmt);
+      return lua_error(L);
+    }
+
+    if (sqlite3_column_type(stmt, 0) == SQLITE_NULL) {
+      sqlite3_finalize(stmt);
+      return luaL_error(L, "failed getting template: content is NULL");
+    }
+
+    const void *tmpl = sqlite3_column_blob(stmt, 0);
+    int tmpl_size = sqlite3_column_bytes(stmt, 0);
+
+    lua_pushlstring(L, tmpl, tmpl_size);
+    // stack: [db, slug, context, etlua, render, template]
+
+    sqlite3_free(tmpl_name);
+    tmpl_name = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 1));
+
+    lua_pushnil(L);
+    lua_copy(L, 3, 7);
+    // stack: [db, slug, context, etlua, render, template, context]
+
+    if (lua_pcall(L, 2, 1, 0) != LUA_OK) {
+      sqlite3_free(tmpl_name);
+      sqlite3_finalize(stmt);
+      return luaL_error(L, "failed rendering template: %s",
+                        lua_tostring(L, -1));
+    }
+    // stack: [db, slug, context, etlua, output]
+
+    if (lua_isnil(L, -1)) {
+      sqlite3_free(tmpl_name);
+      sqlite3_finalize(stmt);
+      return luaL_error(L, "failed rendering template: got nil");
+    }
+
+    if (strcmp(tmpl_name, "") != 0) {
+      lua_setfield(L, 3, "content");
+      sqlite3_reset(stmt);
+      continue;
+      // stack: [db, slug, context, etlua]
+    }
+
+    break;
+  }
+
+  sqlite3_free(tmpl_name);
+  sqlite3_finalize(stmt);
+
+  return 1;
+}
+
 bool match(lua_State *L, char *str, const char *pattern) {
   lua_getglobal(L, "string");
   lua_getfield(L, 1, "match");
@@ -513,7 +633,7 @@ static int import_file(lua_State *L, struct database *db, char *root,
     res.tags[i] = NULL;
   }
 
-  printf("Importing file %s... ", relpath);
+  printf("Importing file %s...\n", relpath);
 
   FILE *fd = fopen(abspath, "rb");
   if (fd == 0) {
@@ -535,11 +655,34 @@ static int import_file(lua_State *L, struct database *db, char *root,
     return errno;
   }
 
+  res.content[fstat.st_size] = '\0';
+
   fclose(fd);
 
   res.size = fstat.st_size;
 
-  if (match(L, abspath, "%.html$")) {
+  if (strcmp(res.name, "import.sql") == 0) {
+    const char *stmts[] = {"BEGIN", res.content, "COMMIT"};
+    for (int i = 0; i < 3; i++) {
+      char *stmt = strtok((char *)stmts[i], ";");
+      while (stmt) {
+        printf("Executing statement %s\n", stmt);
+        int rc = execute(db, stmt);
+        if (rc != SQLITE_OK) {
+          printf("Failed importing %s: %s\n", relpath, db->err_msg);
+          if (i > 0) {
+            execute(db, "ROLLBACK");
+          }
+          free_resource(&res);
+          return rc;
+        }
+
+        stmt = strtok(NULL, ";");
+      }
+    }
+    free_resource(&res);
+    return 0;
+  } else if (match(L, abspath, "%.html$")) {
     parse_html(L, &res, abspath);
   } else if (match(L, abspath, "%.scss$")) {
     parse_scss(L, &res, abspath);
@@ -548,8 +691,6 @@ static int import_file(lua_State *L, struct database *db, char *root,
     res.mime = sqlite3_mprintf("text/x-lua");
     res.slug = replace(L, res.slug, "%.lua$", "");
   }
-
-  printf("%s... ", res.slug);
 
   if (match(L, res.slug, "/index$")) {
     if (!match(L, res.slug, "^/templates/index$")) {
@@ -625,8 +766,6 @@ static int import_file(lua_State *L, struct database *db, char *root,
     free_resource(&res);
     return rc;
   }
-
-  printf("imported as %s at %s\n", res.mime, res.slug);
 
   free_resource(&res);
 
@@ -709,6 +848,76 @@ static int build_dir(lua_State *L, struct database *db, char *root,
   return 0;
 }
 
+static int generate_sitemap(struct database *db) {
+  const char *template =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+      "    <% for i = 1, #resources do %>\n"
+      "    <url>\n"
+      "        <loc><%= baseurl %><%= resources[i].slug %></loc>\n"
+      "        <lastmod><%= resources[i].mtime %></lastmod>\n"
+      "    </url>\n"
+      "    <% end %>\n"
+      "</urlset>";
+  size_t tmpl_size = strlen(template);
+
+  int rc = execute(db,
+                   "INSERT OR REPLACE INTO resources"
+                   "(slug, mime, status, content, size)"
+                   "VALUES ('system:/sitemap.xml', 'application/xml', ?, ?, ?)",
+                   sqlite_bind(SQLITE_INTEGER, PUB, 0, NULL, 0),
+                   sqlite_bind(SQLITE_BLOB, 0, 0, (char *)template, tmpl_size),
+                   sqlite_bind(SQLITE_INTEGER, tmpl_size, 0, NULL, 0));
+  if (rc != SQLITE_OK) {
+    printf("Failed inserting sitemap template: %s\n", db->err_msg);
+    return rc;
+  }
+
+  const char *content = "function render(sheepwool, db, req)\n"
+                        "    local resources = sheepwool.query(db, [[\n"
+                        "        SELECT slug, mtime\n"
+                        "        FROM resources\n"
+                        "        WHERE slug NOT LIKE '/templates/%'\n"
+                        "          AND status = 0\n"
+                        "          AND mime IN ('text/html', 'text/x-lua')\n"
+                        "        ORDER BY slug\n"
+                        "    ]])\n"
+                        "\n"
+                        "    local context = {\n"
+                        "        [\"name\"] = \"Sitemap\",\n"
+                        "        [\"resources\"] = resources,\n"
+                        "        [\"baseurl\"] = string.format(\"%s://%s%s\", "
+                        "req.scheme, req.host, req.root),\n"
+                        "    }\n"
+                        "\n"
+                        "    return \"application/xml\", sheepwool.render(db, "
+                        "\"system:/sitemap.xml\", context)\n"
+                        "end\n"
+                        "\n"
+                        "return {\n"
+                        "    [\"render\"] = render,\n"
+                        "}\n";
+  size_t size = strlen(content);
+
+  rc = execute(
+      db,
+      "INSERT OR REPLACE INTO resources "
+      "(slug, mime, name, ctime, mtime, content, size, status, template)"
+      "VALUES ('/sitemap.xml', 'text/x-lua', 'Sitemap', "
+      "strftime('%Y-%m-%dT%H:%M:%S'), strftime('%Y-%m-%dT%H:%M:%S'), ?, ?, ?, "
+      "?)",
+      sqlite_bind(SQLITE_BLOB, 0, 0, (char *)content, size),
+      sqlite_bind(SQLITE_INTEGER, size, 0, NULL, 0),
+      sqlite_bind(SQLITE_INTEGER, PUB, 0, NULL, 0),
+      sqlite_bind(SQLITE_TEXT, 0, 0, (char *)"system:/sitemap.xml", 0));
+  if (rc != SQLITE_OK) {
+    printf("Failed inserting to database: %s\n", db->err_msg);
+    return rc;
+  }
+
+  return 0;
+}
+
 #if HAVE_UNVEIL
 static int unveil_database(char *dbpath) {
   if (unveil(dbpath, "rwc") == -1) {
@@ -774,6 +983,14 @@ int fsbuild(char *dbpath, char *root) {
   int ret = build_dir(L, &db, root, NULL);
   lua_close(L);
 
+  if (ret) {
+    sqlite_disconnect(&db);
+    return ret;
+  }
+
+  printf("Generating sitemap.xml\n");
+  ret = generate_sitemap(&db);
+
   sqlite_disconnect(&db);
 
   return ret;
@@ -786,6 +1003,58 @@ static void http_open(struct kreq *r, enum khttp code, char *mime) {
   khttp_head(r, "X-Frame-Options", "DENY");
   khttp_head(r, "X-XSS-Protection", "1; mode=block");
 }
+
+const int khttpd[KHTTP__MAX] = {
+    100, /* KHTTP_100 */
+    101, /* KHTTP_101 */
+    103, /* KHTTP_103 */
+    200, /* KHTTP_200 */
+    201, /* KHTTP_201 */
+    202, /* KHTTP_202 */
+    203, /* KHTTP_203 */
+    204, /* KHTTP_204 */
+    205, /* KHTTP_205 */
+    206, /* KHTTP_206 */
+    207, /* KHTTP_207 */
+    300, /* KHTTP_300 */
+    301, /* KHTTP_301 */
+    302, /* KHTTP_302 */
+    303, /* KHTTP_303 */
+    304, /* KHTTP_304 */
+    306, /* KHTTP_306 */
+    307, /* KHTTP_307 */
+    308, /* KHTTP_308 */
+    400, /* KHTTP_400 */
+    401, /* KHTTP_401 */
+    402, /* KHTTP_402 */
+    403, /* KHTTP_403 */
+    404, /* KHTTP_404 */
+    405, /* KHTTP_405 */
+    406, /* KHTTP_406 */
+    407, /* KHTTP_407 */
+    408, /* KHTTP_408 */
+    409, /* KHTTP_409 */
+    410, /* KHTTP_410 */
+    411, /* KHTTP_411 */
+    412, /* KHTTP_412 */
+    413, /* KHTTP_413 */
+    414, /* KHTTP_414 */
+    415, /* KHTTP_415 */
+    416, /* KHTTP_416 */
+    417, /* KHTTP_417 */
+    424, /* KHTTP_424 */
+    428, /* KHTTP_428 */
+    429, /* KHTTP_429 */
+    431, /* KHTTP_431 */
+    500, /* KHTTP_500 */
+    501, /* KHTTP_501 */
+    502, /* KHTTP_502 */
+    503, /* KHTTP_503 */
+    504, /* KHTTP_504 */
+    505, /* KHTTP_505 */
+    507, /* KHTTP_507 */
+    511, /* KHTTP_511 */
+};
 
 int serve(char *dbpath) {
   struct kreq req;
@@ -832,6 +1101,7 @@ int serve(char *dbpath) {
 #endif
 
   while (khttp_fcgi_parse(fcgi, &req) == KCGI_OK) {
+    printf("Accepted %s request to %s\n", kmethods[req.method], req.fullpath);
     struct resource res;
     enum khttp status;
     int errc = 0;
@@ -839,22 +1109,20 @@ int serve(char *dbpath) {
     int rc = load_resource(&db, &res, req.fullpath);
     if (rc == SQLITE_NOTFOUND) {
       status = KHTTP_404;
-      errc = load_resource(&db, &res, (char *)"/404");
+      errc = load_resource(&db, &res, (char *)"/error");
     } else if (rc != SQLITE_OK) {
       fprintf(stderr, "Failed loading resource %s: %s\n", req.fullpath,
               db.err_msg);
 
       status = KHTTP_500;
-      errc = load_resource(&db, &res, (char *)"/500");
+      errc = load_resource(&db, &res, (char *)"/error");
+    } else if (res.status == GONE) {
+      status = KHTTP_410;
+      errc = load_resource(&db, &res, (char *)"/error");
     } else if (res.status == MOVED) {
       status = KHTTP_301;
       res.mime = sqlite3_mprintf("text/plain");
       res.content = sqlite3_mprintf("Moved to %s", res.moved_to);
-      res.size = strlen(res.content);
-    } else if (res.status == GONE) {
-      status = KHTTP_410;
-      res.mime = sqlite3_mprintf("text/plain");
-      res.content = sqlite3_mprintf("No longer exists");
       res.size = strlen(res.content);
     } else {
       status = KHTTP_200;
@@ -863,11 +1131,11 @@ int serve(char *dbpath) {
     }
 
     if (errc == 0) {
-      errc = render_resource(&db, &res, &req);
+      errc = render_resource(&db, &res, &req, status);
       if (errc) {
         status = KHTTP_500;
-        if (load_resource(&db, &res, (char *)"/500") == 0)
-          errc = render_resource(&db, &res, &req);
+        if (load_resource(&db, &res, (char *)"/error") == 0)
+          errc = render_resource(&db, &res, &req, status);
       }
     }
 
@@ -966,27 +1234,6 @@ int load_resource(struct database *db, struct resource *res, char *slug) {
   sqlite3_finalize(stmt);
 
   return SQLITE_OK;
-}
-
-static void pushtablestring(lua_State *L, const char *key, char *value) {
-  lua_pushstring(L, key);
-  lua_pushstring(L, value);
-  lua_settable(L, -3);
-}
-
-static void pushtablelstring(lua_State *L, const char *key, char *value,
-                             int size) {
-  lua_pushstring(L, key);
-  lua_pushlstring(L, value, size);
-  lua_settable(L, -3);
-}
-
-static int open_etlua(lua_State *L) {
-  if (luaL_loadstring(L, (const char *)etlua) != LUA_OK) {
-    return lua_error(L);
-  }
-  lua_call(L, 0, 1);
-  return 1;
 }
 
 static int lua_query(lua_State *L) {
@@ -1132,106 +1379,13 @@ static int lua_post_request(lua_State *L) {
   return 1;
 }
 
-static int lua_render(lua_State *L) {
-  struct database *db = (struct database *)lua_touserdata(L, 1);
-  char *tmpl_name = sqlite3_mprintf("%s", lua_tostring(L, 2));
-
-  // stack: [db, slug, context]
-
-  luaL_requiref(L, "etlua", open_etlua, 0);
-  // stack: [db, slug, context, etlua]
-
-  sqlite3_stmt *stmt;
-  int rc = sqlite3_prepare_v2(db->conn,
-                              "SELECT content, template"
-                              "  FROM resources"
-                              " WHERE slug = ?",
-                              -1, &stmt, NULL);
-  if (rc) {
-    lua_pushfstring(L, "Failed preparing template statement: %s",
-                    sqlite3_errmsg(db->conn));
-    sqlite3_finalize(stmt);
-    return lua_error(L);
-  }
-
-  while (true) {
-    if (lua_getfield(L, 4, "render") != LUA_TFUNCTION) {
-      return luaL_error(L, "failed getting render function: got %s",
-                        lua_typename(L, lua_type(L, -1)));
-    }
-    // stack: [db, slug, context, etlua, render]
-
-    rc = sqlite3_bind_text(stmt, 1, tmpl_name, -1, NULL);
-    if (rc) {
-      lua_pushfstring(L, "Failed binding template slug: %s",
-                      sqlite3_errmsg(db->conn));
-      sqlite3_finalize(stmt);
-      return lua_error(L);
-    }
-
-    int rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) {
-      lua_pushfstring(L, "Failed loading template %s: %s", tmpl_name,
-                      sqlite3_errmsg(db->conn));
-      sqlite3_finalize(stmt);
-      return lua_error(L);
-    }
-
-    if (sqlite3_column_type(stmt, 0) == SQLITE_NULL) {
-      sqlite3_finalize(stmt);
-      return luaL_error(L, "failed getting template: content is NULL");
-    }
-
-    const void *tmpl = sqlite3_column_blob(stmt, 0);
-    int tmpl_size = sqlite3_column_bytes(stmt, 0);
-
-    lua_pushlstring(L, tmpl, tmpl_size);
-    // stack: [db, slug, context, etlua, render, template]
-
-    sqlite3_free(tmpl_name);
-    tmpl_name = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 1));
-
-    lua_pushnil(L);
-    lua_copy(L, 3, 7);
-    // stack: [db, slug, context, etlua, render, template, context]
-
-    if (lua_pcall(L, 2, 1, 0) != LUA_OK) {
-      sqlite3_free(tmpl_name);
-      sqlite3_finalize(stmt);
-      return luaL_error(L, "failed rendering template: %s",
-                        lua_tostring(L, -1));
-    }
-    // stack: [db, slug, context, etlua, output]
-
-    if (lua_isnil(L, -1)) {
-      sqlite3_free(tmpl_name);
-      sqlite3_finalize(stmt);
-      return luaL_error(L, "failed rendering template: got nil");
-    }
-
-    if (strcmp(tmpl_name, "") != 0) {
-      lua_setfield(L, 3, "content");
-      sqlite3_reset(stmt);
-      continue;
-      // stack: [db, slug, context, etlua]
-    }
-
-    break;
-  }
-
-  sqlite3_free(tmpl_name);
-  sqlite3_finalize(stmt);
-
-  return 1;
-}
-
 static const struct luaL_Reg lua_lib[] = {{"query", lua_query},
                                           {"render", lua_render},
                                           {"post", lua_post_request},
                                           {NULL, NULL}};
 
 static int render_lua_resource(struct database *db, struct resource *res,
-                               struct kreq *req) {
+                               struct kreq *req, const int status) {
   lua_State *L = luaL_newstate();
   luaL_openlibs(L);
 
@@ -1273,6 +1427,7 @@ static int render_lua_resource(struct database *db, struct resource *res,
   pushtablestring(L, "root", req->pname);
   pushtablestring(L, "path", req->fullpath);
   pushtablestring(L, "remote", req->remote);
+  pushtableint(L, "status", (int)status);
 
   lua_pushliteral(L, "params");
   lua_newtable(L);
@@ -1311,7 +1466,7 @@ static int render_lua_resource(struct database *db, struct resource *res,
 }
 
 static int render_html_resource(struct database *db, struct resource *res,
-                                struct kreq *req) {
+                                struct kreq *req, const int status) {
   if (res->tmpl == NULL) {
     return 0;
   }
@@ -1321,7 +1476,8 @@ static int render_html_resource(struct database *db, struct resource *res,
 
   lua_pushlightuserdata(L, db);
   lua_pushstring(L, res->tmpl);
-  lua_createtable(L, 0, 9);
+  lua_createtable(L, 0, 10);
+  pushtableint(L, "status", (int)status);
   pushtablestring(L, "reqpath", req->fullpath);
   pushtablestring(L, "baseurl", res->baseurl);
   pushtablestring(L, "slug", res->slug);
@@ -1355,12 +1511,12 @@ static int render_html_resource(struct database *db, struct resource *res,
   return 0;
 }
 
-int render_resource(struct database *db, struct resource *res,
-                    struct kreq *req) {
+int render_resource(struct database *db, struct resource *res, struct kreq *req,
+                    enum khttp status) {
   if (strcmp(res->mime, "text/html") == 0) {
-    return render_html_resource(db, res, req);
+    return render_html_resource(db, res, req, status);
   } else if (strcmp(res->mime, "text/x-lua") == 0) {
-    return render_lua_resource(db, res, req);
+    return render_lua_resource(db, res, req, status);
   }
 
   return 0;

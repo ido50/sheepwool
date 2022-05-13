@@ -1,11 +1,14 @@
+#include <stdbool.h>
+#include <stdint.h>
+
+#include <kcgi.h>
 #include <lua.h>
 #include <sqlite3.h>
-#include <stdbool.h>
-
-struct kreq;
 
 #define MAX_TAGS 10
 #define MAX_PARAMS 100
+
+extern const int khttpd[KHTTP__MAX];
 
 struct database {
   sqlite3 *conn;
@@ -42,8 +45,8 @@ int serve(char *dbpath);
 bool match(lua_State *L, char *str, const char *pattern);
 char *replace(lua_State *L, char *str, const char *pattern, const char *repl);
 int load_resource(struct database *db, struct resource *res, char *slug);
-int render_resource(struct database *db, struct resource *res,
-                    struct kreq *req);
+int render_resource(struct database *db, struct resource *res, struct kreq *req,
+                    enum khttp status);
 void free_resource(struct resource *res);
 
 struct bind_param {
