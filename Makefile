@@ -4,7 +4,7 @@ include Makefile.configure
 
 LDADD_STATIC    =
 BINDIR          = /var/www/cgi-bin
-OBJS            = compats.o main.o sheepwool.o strdup.o strsplit.o
+OBJS            = compats.o main.o base64.o sheepwool.o
 DEPS_PKG        = sqlite3 kcgi lua53 libmagic libsass libcurl
 STATIC_PKG     != [ -z "$(LDADD_STATIC)" ] || echo "--static"
 CFLAGS_PKG     != pkg-config --cflags $(DEPS_PKG)

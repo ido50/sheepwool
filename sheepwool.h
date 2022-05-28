@@ -5,16 +5,9 @@
 #include <lua.h>
 #include <sqlite3.h>
 
-#define MAX_TAGS 10
 #define MAX_PARAMS 100
 
 extern const int khttpd[KHTTP__MAX];
-
-struct database {
-  sqlite3 *conn;
-  const char *err_msg;
-  int err_code;
-};
 
 enum status { PUB, UNPUB, MOVED, GONE };
 
@@ -31,21 +24,19 @@ struct resource {
   char *moved_to;
   char *ctime;
   char *mtime;
-  char *tags[MAX_TAGS];
+  char **tags;
 };
 
-int sqlite_connect(struct database *, char *, bool);
-int sqlite_disconnect(struct database *);
-sqlite3_stmt *prepare(struct database *, const char *, ...);
-int execute(struct database *, const char *, ...);
-int init_rw(struct database *db);
-int init_ro(struct database *db);
+int sqlite_connect(sqlite3 **, char *, bool);
+int sqlite_disconnect(sqlite3 *);
+int prepare(sqlite3 *, sqlite3_stmt **, const char *, ...);
+int execute(sqlite3 *, const char *, ...);
 int fsbuild(char *dbpath, char *root);
 int serve(char *dbpath);
 bool match(lua_State *L, char *str, const char *pattern);
 char *replace(lua_State *L, char *str, const char *pattern, const char *repl);
-int load_resource(struct database *db, struct resource *res, char *slug);
-int render_resource(struct database *db, struct resource *res, struct kreq *req,
+int load_resource(sqlite3 *db, struct resource *res, char *slug);
+int render_resource(sqlite3 *db, struct resource *res, struct kreq *req,
                     enum khttp status);
 void free_resource(struct resource *res);
 

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 
 #include "sheepwool.h"
 
@@ -35,6 +36,8 @@ int main(int argc, char **argv) {
   if (argc < 3 || (argc == 3 && strcmp(argv[1], "build") == 0)) {
     usage(EXIT_FAILURE);
   }
+
+  openlog("sheepwool", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
 
   int ret = 0;
   if (strcmp(argv[1], "build") == 0)
