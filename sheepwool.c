@@ -1011,43 +1011,6 @@ cleanup:
   return rc;
 }
 
-#if HAVE_UNVEIL
-static int unveil_database(char *dbpath) {
-  syslog(LOG_DEBUG, "Unveiling database");
-
-  char *shmpath;
-  char *walpath;
-
-  int rc = 0;
-
-  if (unveil(dbpath, "rwc") == -1) {
-    syslog(LOG_ERR, "Failed unveiling %s: %m", dbpath);
-    rc = 1;
-    goto cleanup;
-  }
-
-  shmpath = sqlite3_mprintf("%s-shm", dbpath);
-  if (unveil(shmpath, "rwc") == -1) {
-    syslog(LOG_ERR, "Failed unveiling %s-shm: %m", dbpath);
-    rc = 1;
-    goto cleanup;
-  }
-
-  char *walpath = sqlite3_mprintf("%s-wal", dbpath);
-  if (unveil(walpath, "rwc") == -1) {
-    syspath(LOG_ERR, "Failed unveiling %s-wal", dbpath);
-    rc = 1;
-    goto cleanup;
-  }
-
-cleanup:
-  sqlite3_free(shmpath);
-  sqlite3_free(walpath);
-
-  return rc;
-}
-#endif
-
 int fsbuild(char *dbpath, char *root) {
   int rc = 0;
   lua_State *L = 0;
@@ -1064,9 +1027,11 @@ int fsbuild(char *dbpath, char *root) {
 #endif
 
 #if HAVE_UNVEIL
-  rc = unveil_database(dbpath);
-  if (rc)
+  if (unveil(dirname(dbpath), "rwc") == -1) {
+    syslog(LOG_ERR, "Failed unveiling database: %m");
+    rc = 1;
     goto cleanup;
+  }
   if (unveil(root, "r") == -1) {
     syslog(LOG_ERR, "Failed unveiling source directory: %m");
     rc = 1;
@@ -1188,9 +1153,11 @@ int serve(char *dbpath) {
   }
 #endif
 #if HAVE_UNVEIL
-  rc = unveil_database(dbpath);
-  if (rc)
+  if (unveil(dirname(dbpath), "rwc") == -1) {
+    syslog(LOG_ERR, "Failed unveiling database: %m");
+    rc = 1;
     goto cleanup;
+  }
   if (unveil("/etc/ssl/cert.pem", "r") == -1) {
     syslog(LOG_ERR, "Failed unveiling certificates");
     rc = 1;
