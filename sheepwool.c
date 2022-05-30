@@ -9,7 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
@@ -398,9 +401,8 @@ cleanup:
   sqlite3_free(tmpl_name);
   syslog(LOG_DEBUG, "Finalizing lua_render statement");
   sqlite3_finalize(stmt);
-  if (rc) {
+  if (rc)
     return lua_error(L);
-  }
 
   return 1;
 }
@@ -521,6 +523,8 @@ static int parse_html(lua_State *L, struct resource *res, char *abspath) {
         int i = 0;
         char *tag = strtok(value, ", ");
         while (tag) {
+          // we are allocating enough memory for one tag (or the number of tags
+          // we have) plus one NULL pointer (sentinel)
           if (i)
             res->tags = sqlite3_realloc(res->tags, sizeof(char *) * (i + 2));
           else
@@ -1348,10 +1352,11 @@ int load_resource(sqlite3 *db, struct resource *res, char *slug) {
     char *tag = strtok(tags, ",");
     int i = 0;
     while (tag) {
+      // we are allocating enough memory for the tags, plus a NULL sentinel
       if (i)
-        res->tags = sqlite3_realloc(res->tags, sizeof(char *) * (i + 2));
+        res->tags = sqlite3_realloc(res->tags, sizeof(res->tags) * (i + 2));
       else
-        res->tags = sqlite3_malloc(sizeof(char *) * 2);
+        res->tags = sqlite3_malloc(sizeof(res->tags) * 2);
       res->tags[i] = tag;
       tag = strtok(NULL, ",");
       i++;
@@ -1365,6 +1370,18 @@ cleanup:
   sqlite3_finalize(stmt);
 
   return rc;
+}
+
+static int lua_base64_encode(lua_State *L) {
+  size_t size;
+  const char *input = luaL_checklstring(L, 1, &size);
+
+  unsigned char *encoded = malloc(b64e_size(size) + 1);
+  int encoded_size = b64_encode((const unsigned char *)input, size, encoded);
+
+  lua_pushlstring(L, (const char *)encoded, encoded_size);
+
+  return 1;
 }
 
 static int lua_query(lua_State *L) {
@@ -1487,6 +1504,139 @@ cleanup:
   return 1;
 }
 
+static unsigned char *read_fd(lua_State *L, int fd, int *size) {
+  unsigned char *output;
+
+  while (true) {
+    const size_t read_size = 512;
+    unsigned char buf[read_size];
+    int nread = read(fd, buf, read_size);
+    switch (nread) {
+    case -1:
+      if (errno == EAGAIN) {
+        sleep(1);
+        break;
+      } else {
+        lua_pushfstring(L, "Failed reading command stdout: %s (code: %d)",
+                        strerror(errno), errno);
+        return NULL;
+      }
+    case 0:
+      output[*size] = 0;
+      *size += 1;
+      close(fd);
+      return output;
+    default:
+      if (*size)
+        output = realloc(output, *size + nread + 1);
+      else
+        output = malloc(nread + 1);
+
+      if (*size == 0) {
+        memcpy(output, buf, nread);
+      } else {
+        memcpy(output + *size - 1, buf, nread);
+      }
+
+      *size += nread;
+      break;
+    }
+  }
+}
+
+static int lua_execute(lua_State *L) {
+  syslog(LOG_DEBUG, "Executing command");
+
+  bool has_stdin = lua_gettop(L) == 3;
+
+  const char *cmd = luaL_checkstring(L, 1);
+
+  int num_args = luaL_len(L, 2);
+  char *argv[num_args + 2];
+  argv[0] = (char *)cmd;
+  for (int i = 0; i < num_args; i++) {
+    lua_pushinteger(L, i + 1);
+    lua_gettable(L, 2);
+    argv[i + 1] = (char *)lua_tostring(L, -1);
+  }
+  argv[num_args + 1] = NULL;
+
+  size_t inp_size = 0;
+  char *inp;
+  if (has_stdin)
+    inp = (char *)luaL_checklstring(L, 3, &inp_size);
+
+  int stdin_pipe[2], stdout_pipe[2];
+  pid_t childpid;
+
+  if (pipe(stdin_pipe) == -1)
+    return luaL_error(L, "Failed creating stdin pipe: %s (code: %d)",
+                      strerror(errno), errno);
+  if (pipe(stdout_pipe) == -1)
+    return luaL_error(L, "Failed creating stdout pipe: %s (code: %d)",
+                      strerror(errno), errno);
+
+  syslog(LOG_DEBUG, "Forking");
+
+  if ((childpid = fork()) == -1) {
+    return luaL_error(L, "Failed forking: %s (code: %d)", strerror(errno),
+                      errno);
+  }
+
+  if (childpid == 0) {
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+
+    if (dup2(stdin_pipe[0], 0) == -1) {
+      fprintf(stderr, "Failed duplicating stdin pipe: %s (code: %d)",
+              strerror(errno), errno);
+      exit(1);
+    }
+    if (dup2(stdout_pipe[1], 1) == -1) {
+      fprintf(stderr, "Failed duplicating stdout pipe: %s (code: %d)",
+              strerror(errno), errno);
+      exit(1);
+    }
+
+    if (execvp(cmd, argv) == -1) {
+      fprintf(stderr, "Failed executing %s: %s (code: %d)", cmd,
+              strerror(errno), errno);
+      exit(1);
+    }
+  }
+
+  syslog(LOG_DEBUG, "Started child process %d", childpid);
+
+  close(stdin_pipe[0]);
+  close(stdout_pipe[1]);
+
+  if (inp_size) {
+    write(stdin_pipe[1], inp, inp_size);
+    close(stdin_pipe[1]);
+  }
+
+  syslog(LOG_DEBUG, "Reading from stdout");
+  int output_size = 0;
+  unsigned char *output = read_fd(L, stdout_pipe[0], &output_size);
+  if (output == NULL)
+    return lua_error(L);
+
+  int status;
+  if (waitpid(childpid, &status, 0) == -1)
+    return luaL_error(L, "Process failed: %s (code: %d)", strerror(errno),
+                      errno);
+
+  syslog(LOG_DEBUG, "Child process exited %d", status);
+
+  if (status)
+    return luaL_error(L, "Process exited with status %d", status);
+
+  lua_pushlstring(L, (const char *)output, output_size);
+  lua_pushinteger(L, output_size);
+
+  return 2;
+}
+
 static int lua_post_request(lua_State *L) {
   CURL *curl;
   CURLcode res = CURLE_OK;
@@ -1499,7 +1649,8 @@ static int lua_post_request(lua_State *L) {
 
   curl = curl_easy_init();
   if (!curl) {
-    lua_pushfstring(L, "Failed creating request: %s", strerror(errno));
+    lua_pushfstring(L, "Failed creating request: %s (code: %d)",
+                    strerror(errno), errno);
     res = CURLE_OBSOLETE;
     goto cleanup;
   }
@@ -1532,8 +1683,10 @@ cleanup:
 }
 
 static const struct luaL_Reg lua_lib[] = {{"query", lua_query},
+                                          {"execute", lua_execute},
                                           {"render", lua_render},
                                           {"post", lua_post_request},
+                                          {"base64_encode", lua_base64_encode},
                                           {NULL, NULL}};
 
 static int render_lua_resource(sqlite3 *db, struct resource *res,
@@ -1556,6 +1709,8 @@ static int render_lua_resource(sqlite3 *db, struct resource *res,
     syslog(LOG_ERR, "Failed evaluating Lua code: %s", lua_tostring(L, -1));
     goto cleanup;
   }
+
+  syslog(LOG_DEBUG, "Getting render function");
 
   if (lua_getglobal(L, "render") != LUA_TFUNCTION) {
     syslog(LOG_ERR, "Failed getting resource's render function, it is %s",
@@ -1586,6 +1741,8 @@ static int render_lua_resource(sqlite3 *db, struct resource *res,
   pushtablestring(L, "remote", req->remote);
   pushtableint(L, "status", (int)status);
 
+  syslog(LOG_DEBUG, "Pushing parameters");
+
   lua_pushliteral(L, "params");
   lua_newtable(L);
   if (req->fieldsz > 0) {
@@ -1594,11 +1751,10 @@ static int render_lua_resource(sqlite3 *db, struct resource *res,
         lua_pushstring(L, req->fields[i].key);
         lua_createtable(L, 0, 2);
         lua_pushstring(L, "content");
-        unsigned char *encoded = malloc(b64e_size(req->fields[i].valsz));
+        unsigned char *encoded = malloc(b64e_size(req->fields[i].valsz) + 1);
         int encoded_size = b64_encode((const unsigned char *)req->fields[i].val,
                                       req->fields[i].valsz, encoded);
         lua_pushlstring(L, (const char *)encoded, encoded_size);
-        syslog(LOG_DEBUG, "BASE64: %s", encoded);
         free(encoded);
         lua_settable(L, -3);
         lua_pushstring(L, "mime");
@@ -1615,6 +1771,8 @@ static int render_lua_resource(sqlite3 *db, struct resource *res,
   }
   lua_settable(L, -3);
 
+  syslog(LOG_DEBUG, "Pushing headers");
+
   lua_pushliteral(L, "headers");
   lua_newtable(L);
   if (req->reqsz > 0) {
@@ -1624,6 +1782,8 @@ static int render_lua_resource(sqlite3 *db, struct resource *res,
   }
   lua_settable(L, -3);
   // stack: [resource_lua, render, sheepwool, db, context]
+
+  syslog(LOG_DEBUG, "Calling render function");
 
   rc = lua_pcall(L, 3, 2, 0);
   if (rc != LUA_OK) {
