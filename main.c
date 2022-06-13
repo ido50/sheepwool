@@ -29,22 +29,26 @@ static void usage(int exit_code) {
   const char *progname = getprogname();
   fprintf(output, "usage: %s build db_path src_path\n", progname);
   fprintf(output, "       %s serve db_path\n", progname);
+  fprintf(output, "       %s version\n", progname);
   exit(exit_code);
 }
 
 int main(int argc, char **argv) {
-  if (argc < 3 || (argc == 3 && strcmp(argv[1], "build") == 0)) {
-    usage(EXIT_FAILURE);
-  }
-
   openlog("sheepwool", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
 
   int ret = 0;
-  if (strcmp(argv[1], "build") == 0)
+  if (strcmp(argv[1], "build") == 0) {
+    if (argc < 4)
+      usage(EXIT_FAILURE);
     ret = fsbuild(argv[2], argv[3]);
-  else if (strcmp(argv[1], "serve") == 0)
+  } else if (strcmp(argv[1], "serve") == 0) {
+    if (argc < 3)
+      usage(EXIT_FAILURE);
     ret = serve(argv[2]);
-  else
+  } else if (strcmp(argv[1], "version") == 0) {
+    fprintf(stdout, "%s v%s\n", getprogname(), VERSION);
+    ret = 0;
+  } else
     usage(EXIT_FAILURE);
 
   return ret;

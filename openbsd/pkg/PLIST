@@ -1,9 +1,0 @@
-@comment $ OpenBSD$
-sbin/yourprog-upgrade
-share/yourprog/
-share/yourprog/yourprog.kwbp
-@cwd ${VARBASE}/www
-htdocs/index.html
-htdocs/index.min.js
-@bin cgi-bin/yourprog
-@exec yourprog-upgrade 
