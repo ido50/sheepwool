@@ -868,6 +868,7 @@ static int build_dir(lua_State *L, sqlite3 *db, char *root, char *relpath) {
   char *abspath = NULL;
   char *absfilepath = NULL;
   char *relfilepath = NULL;
+  DIR *dir = NULL;
 
   if (relpath == NULL) {
     abspath = sqlite3_mprintf("%s", root);
@@ -875,9 +876,15 @@ static int build_dir(lua_State *L, sqlite3 *db, char *root, char *relpath) {
     abspath = sqlite3_mprintf("%s/%s", root, relpath);
   }
 
+  char *ignorepath = sqlite3_mprintf("%s/.nowool", abspath);
+  if (access(ignorepath, F_OK) == 0) {
+    syslog(LOG_DEBUG, "Ignoring directory %s because of .nowool file", abspath);
+    goto cleanup;
+  }
+
   syslog(LOG_DEBUG, "Building directory %s", abspath);
 
-  DIR *dir = opendir(abspath);
+  dir = opendir(abspath);
   if (dir == NULL) {
     rc = 1;
     syslog(LOG_ERR, "Failed opening directory %s: %m", abspath);
@@ -930,7 +937,9 @@ static int build_dir(lua_State *L, sqlite3 *db, char *root, char *relpath) {
   }
 
 cleanup:
-  closedir(dir);
+  if (dir)
+    closedir(dir);
+  sqlite3_free(ignorepath);
   sqlite3_free(abspath);
 
   return rc;
@@ -1658,7 +1667,8 @@ static const struct luaL_Reg lua_lib[] = {{"query", lua_query},
 
 static int render_lua_resource(sqlite3 *db, struct resource *res,
                                struct kreq *req, const int status) {
-  syslog(LOG_DEBUG, "Rendering Lua resource %s", res->slug);
+  syslog(LOG_DEBUG, "Rendering Lua resource %s with status %d", res->slug,
+         status);
 
   int rc = 0;
 
@@ -1777,7 +1787,8 @@ static int render_html_resource(sqlite3 *db, struct resource *res,
     return 0;
   }
 
-  syslog(LOG_DEBUG, "Rendering HTML resource %s", res->slug);
+  syslog(LOG_DEBUG, "Rendering HTML resource %s with status %d", res->slug,
+         status);
 
   lua_State *L = luaL_newstate();
   luaL_openlibs(L);
@@ -1822,9 +1833,9 @@ static int render_html_resource(sqlite3 *db, struct resource *res,
 int render_resource(sqlite3 *db, struct resource *res, struct kreq *req,
                     enum khttp status) {
   if (strcmp(res->mime, "text/html") == 0) {
-    return render_html_resource(db, res, req, status);
+    return render_html_resource(db, res, req, khttpd[status]);
   } else if (strcmp(res->mime, "text/x-lua") == 0) {
-    return render_lua_resource(db, res, req, status);
+    return render_lua_resource(db, res, req, khttpd[status]);
   }
 
   return 0;
