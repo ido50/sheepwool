@@ -68,7 +68,7 @@ if [ -n "${MAKELEVEL}" ]; then
 	fi
 fi
 
-if [ -n "$MAKE_FLAGS" ]; then 
+if [ -n "$MAKE_FLAGS" ]; then
 	echo "GNU submake detected: using --no-print-directory" 1>&2
 	echo "GNU submake detected: using --no-print-directory" 1>&3
 fi
@@ -89,6 +89,7 @@ LDADD_MD5=
 LDADD_SHA2=
 LDADD_LIB_SOCKET=
 LDADD_STATIC=
+LDADD_INOTIFYTOOLS=
 CPPFLAGS=
 LDFLAGS=
 DESTDIR=
@@ -188,6 +189,7 @@ HAVE_FTS=
 HAVE_GETEXECNAME=
 HAVE_GETPROGNAME=
 HAVE_INFTIM=
+HAVE_INOTIFYTOOLS=
 HAVE_LANDLOCK=
 HAVE_MD5=
 HAVE_MEMMEM=
@@ -278,7 +280,7 @@ ${COMP} -DTEST_${2} ${3} -o test-${1} tests.c ${LDFLAGS} ${4}
 __HEREDOC__
 	if ${COMP} -DTEST_${2} ${3} -o "test-${1}" tests.c ${LDFLAGS} ${4} 1>&3 2>&3; then
 		echo "${1}: ${CC} succeeded" 1>&3
-	else 
+	else
 		if [ -n "${5}" ] ; then
 			echo "${1}: ${CC} failed with $? (retrying)" 1>&3
 			cat 1>&3 << __HEREDOC__
@@ -288,7 +290,7 @@ __HEREDOC__
 			if ${COMP} -DTEST_${2} ${3} -o "test-${1}" tests.c ${LDFLAGS} ${5} 1>&3 2>&3; then
 				echo "${1}: ${CC} succeeded" 1>&3
 				extralib="(with ${5})"
-			else 
+			else
 				echo "${1}: ${CC} failed with $?" 1>&3
 				echo 1>&3
 				return 1
@@ -300,7 +302,7 @@ __HEREDOC__
 		fi
 	fi
 
-	if [ -n "${extralib}" ] 
+	if [ -n "${extralib}" ]
 	then
 		eval "LDADD_${2}=\"${5}\""
 	elif [ -n "${4}" ]
@@ -318,7 +320,7 @@ __HEREDOC__
 
 # Run a complete autoconfiguration test, including the check for
 # a manual override and disabling the feature on failure.
-# Arguments: lower case name, upper case name, additional CFLAGS, 
+# Arguments: lower case name, upper case name, additional CFLAGS,
 # additional LDADD, alternative LDADD.
 
 runtest() {
@@ -340,8 +342,8 @@ runtest() {
 #    (1) test file
 #    (2) macro to set
 #    (3) argument to cc *before* -o
-#    (4) argument to cc *after* 
-#    (5) alternative argument to cc *after* 
+#    (4) argument to cc *after*
+#    (5) alternative argument to cc *after*
 #----------------------------------------------------------------------
 
 runtest arc4random	ARC4RANDOM			  || true
@@ -352,6 +354,7 @@ runtest crypt_newhash	CRYPT_NEWHASH		  	  || true
 runtest endian_h	ENDIAN_H			  || true
 runtest err		ERR				  || true
 runtest explicit_bzero	EXPLICIT_BZERO			  || true
+runtest inotifytools		INOTIFYTOOLS "" "" "-linotifytools"				  || true
 runtest fts		FTS				  || true
 runtest getexecname	GETEXECNAME			  || true
 runtest getprogname	GETPROGNAME			  || true
@@ -514,6 +517,7 @@ cat << __HEREDOC__
 #define HAVE_ENDIAN_H ${HAVE_ENDIAN_H}
 #define HAVE_ERR ${HAVE_ERR}
 #define HAVE_EXPLICIT_BZERO ${HAVE_EXPLICIT_BZERO}
+#define HAVE_INOTIFYTOOLS ${HAVE_INOTIFYTOOLS}
 #define HAVE_FTS ${HAVE_FTS}
 #define HAVE_GETEXECNAME ${HAVE_GETEXECNAME}
 #define HAVE_GETPROGNAME ${HAVE_GETPROGNAME}
@@ -1645,7 +1649,7 @@ struct {								\\
 	SPLAY_RIGHT(tmp, field) = (head)->sph_root;			\\
 	(head)->sph_root = tmp;						\\
 } while (0)
-	
+
 #define SPLAY_ROTATE_LEFT(head, tmp, field) do {			\\
 	SPLAY_RIGHT((head)->sph_root, field) = SPLAY_LEFT(tmp, field);	\\
 	SPLAY_LEFT(tmp, field) = (head)->sph_root;			\\
@@ -2433,6 +2437,7 @@ LDADD_LIB_SOCKET = ${LDADD_LIB_SOCKET}
 LDADD_MD5	 = ${LDADD_MD5}
 LDADD_SHA2	 = ${LDADD_SHA2}
 LDADD_STATIC	 = ${LDADD_STATIC}
+LDADD_INOTIFYTOOLS = ${LDADD_INOTIFYTOOLS}
 LDFLAGS		 = ${LDFLAGS}
 STATIC		 = ${STATIC}
 PREFIX		 = ${PREFIX}

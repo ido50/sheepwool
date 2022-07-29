@@ -4,22 +4,19 @@ include Makefile.configure
 
 LDADD_STATIC    =
 BINDIR          = /var/www/cgi-bin
-OBJS            = compats.o main.o base64.o sheepwool.o
-DEPS_PKG        = sqlite3 kcgi lua53 libmagic libsass libcurl
+OBJS            = compats.o main.o server.o fsbuild.o lua_registry.o database.o
+DEPS_PKG        = sqlite3 lua53 libmagic libsass libcurl libmicrohttpd
 STATIC_PKG     != [ -z "$(LDADD_STATIC)" ] || echo "--static"
 CFLAGS_PKG     != pkg-config --cflags $(DEPS_PKG)
 LDADD_PKG      != pkg-config --libs $(STATIC_PKG) $(DEPS_PKG)
-VERSION         = 5.0.0
-LDADD          += $(LDADD_PKG) $(LDADD_CRYPT)
-CFLAGS         += -Ideps $(CFLAGS_PKG) -DVERSION=\"$(VERSION)\"
+VERSION         = 6.0.0
+LDADD          += $(LDADD_PKG) $(LDADD_CRYPT) $(LDADD_B64_NTOP) $(LDADD_INOTIFYTOOLS)
+CFLAGS         += -Ideps $(CFLAGS_PKG) -DVERSION=\"$(VERSION)\" -O0
 
 all: sheepwool
 
-etlua.h:
-	wget -O- https://raw.githubusercontent.com/leafo/etlua/v1.3.0/etlua.lua | xd -detlua > etlua.c
-
-sheepwool: etlua.h $(OBJS)
-	$(CC) -std=c99 $(LDADD_STATIC) -o $@ $(OBJS) $(LDFLAGS) $(LDADD)
+sheepwool: $(OBJS)
+	$(CC) $(CFLAGS) $(LDADD_STATIC) -o $@ $(OBJS) $(LDFLAGS) $(LDADD)
 
 install: all
 	mkdir -p $(BINDIR)

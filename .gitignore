@@ -6,3 +6,8 @@ sheepwool
 pid-file
 .ccls-cache
 *.old
+vgcore*
+*.db
+*.db-shm
+*.db-wal
+*.core

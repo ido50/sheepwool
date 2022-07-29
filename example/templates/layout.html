@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="author" content="Ido Perlmuter">
+        <meta name="description" content="Example Website for SheepWool">
+        <meta http-equiv="X-UA-Compatible" content="ie=edge">
+        <title><%= name %></title>
+        <style>
+        body {
+          text-align: center;
+        }
+        table {
+          width: auto;
+          margin: 0 auto;
+          border: 1px solid #777;
+          border-collapse: collapse;
+        }
+        table td, table th {
+          text-align: left;
+          border: 1px solid #777;
+          padding: 0.25rem 0.5rem;
+        }
+        </style>
+    </head>
+    <body>
+      <%- content %>
+    </body>
+</html>

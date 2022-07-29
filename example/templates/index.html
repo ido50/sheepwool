@@ -1,0 +1,85 @@
+<!-- template: /templates/layout -->
+
+<h1><%= name %></h1>
+<table>
+  <tr>
+    <th scope="row">scheme</th>
+    <td><%= scheme %></td>
+  </tr>
+  <tr>
+    <th scope="row">host</th>
+    <td><%= host %></td>
+  </tr>
+  <tr>
+    <th scope="row">baseurl</th>
+    <td><%= baseurl %></td>
+  </tr>
+  <tr>
+    <th scope="row">method</th>
+    <td><%= method %></td>
+  </tr>
+  <tr>
+    <th scope="row">path</th>
+    <td><%= path %></td>
+  </tr>
+  <tr>
+    <th scope="row">srcpath</th>
+    <td><%= srcpath %></td>
+  </tr>
+  <tr>
+    <th scope="row">status</th>
+    <td><%= status %></td>
+  </tr>
+
+  <% if #tags == 0 then %>
+  <tr>
+    <th scope="row">tags</th>
+    <td>-</td>
+  </tr>
+  <% else %>
+  <tr>
+    <th scope="row" rowspan="<%= #tags %>">tags</th>
+    <td><%= tags[1] %></td>
+  </tr>
+    <% if #tags > 1 then %>
+      <% for i = 2, #tags do %>
+  <tr>
+    <td><%= tags[i] %></td>
+  </tr>
+      <% end %>
+    <% end %>
+  <% end %>
+</table>
+
+<h2>Headers</h2>
+
+<table>
+  <% for k, v in pairs(headers) do %>
+  <tr>
+    <th scope="row"><%= k %></th>
+    <td><%= v %></td>
+  </tr>
+  <% end %>
+</table>
+
+<h2>Params</h2>
+
+<table>
+  <% for k, v in pairs(params) do %>
+    <% if type(v) == "table" then %>
+      <% for i = 1, #v do %>
+  <tr>
+        <% if i == 1 then %>
+    <th scope="row" rowspan="<%= #v %>"><%= k %></th>
+        <% end %>
+    <td><%= v[i] %></td>
+  </tr>
+      <% end %>
+    <% else %>
+  <tr>
+    <th scope="row"><%= k %></th>
+    <td><%= v %></td>
+  </tr>
+    <% end %>
+  <% end %>
+</table>
