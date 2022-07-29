@@ -1,0 +1,1 @@
+int serve(char *dbpath);

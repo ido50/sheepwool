@@ -22,7 +22,8 @@
 #include <string.h>
 #include <syslog.h>
 
-#include "sheepwool.h"
+#include "fsbuild.h"
+#include "server.h"
 
 static void usage(int exit_code) {
   FILE *output = exit_code ? stderr : stdout;
@@ -37,15 +38,15 @@ int main(int argc, char **argv) {
   openlog("sheepwool", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
 
   int ret = 0;
-  if (strcmp(argv[1], "build") == 0) {
+  if (argc > 1 && strcmp(argv[1], "build") == 0) {
     if (argc < 4)
       usage(EXIT_FAILURE);
     ret = fsbuild(argv[2], argv[3]);
-  } else if (strcmp(argv[1], "serve") == 0) {
+  } else if (argc > 1 && strcmp(argv[1], "serve") == 0) {
     if (argc < 3)
       usage(EXIT_FAILURE);
     ret = serve(argv[2]);
-  } else if (strcmp(argv[1], "version") == 0) {
+  } else if (argc > 1 && strcmp(argv[1], "version") == 0) {
     fprintf(stdout, "%s v%s\n", getprogname(), VERSION);
     ret = 0;
   } else
