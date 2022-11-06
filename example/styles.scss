@@ -1,0 +1,14 @@
+body {
+  text-align: center;
+  table {
+    width: auto;
+    margin: 0 auto;
+    border: 1px solid #777;
+    border-collapse: collapse;
+    td, th {
+      text-align: left;
+      border: 1px solid #777;
+      padding: 0.25rem 0.5rem;
+    }
+  }
+}

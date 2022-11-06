@@ -17,24 +17,16 @@
 #include "config.h"
 
 #include <errno.h>
-#include <libgen.h>
-#include <signal.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <syslog.h>
-#include <sqlite3.h>
 #include <unistd.h>
 
-#include "database.h"
-#include "fsbuild.h"
 #include "server.h"
 
 static void usage(int exit_code) {
   fprintf(exit_code ? stderr : stdout,
-          "usage: %s [-h] [-V] [-p PORT] [-S] DB_PATH SRC_PATH\n", getprogname());
+          "usage: %s [-h] [-V] [-p PORT] SRC_PATH\n", getprogname());
   exit(exit_code);
 }
 
@@ -54,38 +46,32 @@ static unsigned int parse_port_opt(char *optarg) {
   return (unsigned)port;
 }
 
-static int sandbox(char *dbpath, char *root, char *logpath) {
+static int sandbox(char *root) {
 #if HAVE_PLEDGE
-  int rc = pledge("unix sendfd recvfd inet dns proc stdio rpath wpath cpath flock fattr unveil", NULL);
+  int rc = pledge("unix sendfd recvfd inet dns proc stdio rpath wpath cpath "
+                  "flock fattr unveil",
+                  NULL);
   if (rc == -1) {
-    fprintf(stderr, "Failed pledging: %s", strerror(errno));
+    fprintf(stderr, "Failed pledging: %s\n", strerror(errno));
     return rc;
   }
 #endif
 
 #if HAVE_UNVEIL
-  if ((rc = unveil(dirname(dbpath), "rwc")) == -1) {
-    syslog(LOG_ERR, "Failed unveiling database: %m");
-    return rc;
-  }
-  if ((rc = unveil(logpath, "rwc")) == -1) {
-    syslog(LOG_ERR, "Failed unveiling log file: %m");
-    return rc;
-  }
-  if ((rc = unveil(root, "r")) == -1) {
-    syslog(LOG_ERR, "Failed unveiling source directory: %m");
+  if ((rc = unveil(root, "rwc")) == -1) {
+    fprintf(stderr, "Failed unveiling source directory: %s\n", strerror(errno));
     return rc;
   }
   if ((rc = unveil("/usr/local/share/misc/magic.mgc", "r")) == -1) {
-    syslog(LOG_ERR, "Failed unveiling magic database: %m");
+    fprintf(stderr, "Failed unveiling magic database: %s\n", strerror(errno));
     return rc;
   }
   if ((rc = unveil("/etc/ssl/cert.pem", "r")) == -1) {
-    syslog(LOG_ERR, "Failed unveiling certificates");
+    fprintf(stderr, "Failed unveiling certificates\n");
     return rc;
   }
   if ((rc = unveil(NULL, NULL)) == -1) {
-    syslog(LOG_ERR, "Failed closing unveil: %m");
+    fprintf(stderr, "Failed closing unveil: %s\n", strerror(errno));
     return rc;
   }
 #endif
@@ -93,17 +79,11 @@ static int sandbox(char *dbpath, char *root, char *logpath) {
   return 0;
 }
 
-sqlite3 *db;
-
 int main(int argc, char **argv) {
-  openlog("sheepwool", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
-
   int ch;
-  bool nobuild = false;
-  char *logpath = NULL;
 
   unsigned int port = 8080;
-  while ((ch = getopt(argc, argv, "hVp:l:S")) != -1) {
+  while ((ch = getopt(argc, argv, "hVp:")) != -1) {
     switch (ch) {
     case 'h':
       usage(EXIT_SUCCESS);
@@ -115,12 +95,6 @@ int main(int argc, char **argv) {
     case 'p':
       port = parse_port_opt(optarg);
       break;
-    case 'l':
-      logpath = optarg;
-      break;
-    case 'S':
-      nobuild = true;
-      break;
     default:
       usage(EXIT_FAILURE);
     }
@@ -128,64 +102,30 @@ int main(int argc, char **argv) {
   argc -= optind;
   argv += optind;
 
-  if (argc != 2) {
-    fprintf(stderr, "DB_PATH and SRC_PATH must be provided.\n");
+  if (argc != 1) {
+    fprintf(stderr, "SRC_PATH must be provided.\n");
     usage(EXIT_FAILURE);
   }
 
-  char *root = argv[1];
+  char *root = argv[0];
 
-  /* remove trailing slash from root, if exists */
-  if (root[strlen(argv[1])-1] == '/')
-    root[strlen(argv[1])-1] = '\0';
+  // remove trailing slash from root, if exists
+  if (root[strlen(argv[0]) - 1] == '/')
+    root[strlen(argv[0]) - 1] = '\0';
 
-  int rc = sandbox(argv[0], root, logpath);
+  int rc = sandbox(root);
   if (rc)
     exit(EXIT_FAILURE);
 
-  rc = sqlite_connect(&db, argv[0], false);
-  if (rc)
-    goto cleanup;
-
-  pid_t cpid = -1;
-
-  if (!nobuild) {
-    rc = fsbuild(db, root);
-    if (rc)
-      goto cleanup;
-
-    cpid = fork();
-  }
-
-  if (cpid == 0) {
-    rc = fswatch(db, root);
-  } else {
-    if (cpid > 0)
-      signal(SIGCHLD, SIG_IGN);
-
-    rc = serve(db, port, logpath);
-    if (rc)
-      syslog(LOG_ERR, "HTTP server failed: %m");
-
-    if (cpid > 0) {
-      if (kill(cpid, SIGQUIT) == -1) {
-        syslog(LOG_WARNING, "Failed closing file watcher: %m");
-        goto cleanup;
-      }
-
-      int wstatus;
-      if (waitpid(cpid, &wstatus, WUNTRACED | WCONTINUED) == -1) {
-        syslog(LOG_WARNING, "File watched did not respond: %m");
-        goto cleanup;
-      }
-    }
-  }
-
-cleanup:
-  sqlite_disconnect(db);
-
-  if (rc)
+  rc = chdir(root);
+  if (rc) {
+    fprintf(stderr, "Failed changing directory: %s\n", strerror(errno));
     exit(EXIT_FAILURE);
+  }
 
-  exit(EXIT_SUCCESS);
+  rc = serve(port);
+  if (rc)
+    fprintf(stderr, "HTTP server failed: %s\n", strerror(errno));
+
+  exit(rc ? EXIT_FAILURE : EXIT_SUCCESS);
 }

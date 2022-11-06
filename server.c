@@ -16,66 +16,52 @@
  */
 #include "config.h"
 
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <syslog.h>
-
+#include <arpa/inet.h> // for inet_ntoa
+#include <errno.h>
 #include <lauxlib.h>
 #include <lua.h>
 #include <lualib.h>
+#include <magic.h>
 #include <microhttpd.h>
+#include <netinet/in.h> // for sockaddr_in
+#include <signal.h>     // for size_t, signal, SIGINT
 #include <sqlite3.h>
+#include <stdbool.h>    // for false, bool, true
+#include <stdint.h>     // for uint64_t
+#include <stdio.h>      // for NULL, fprintf, stderr, stdout
+#include <stdlib.h>     // for free, malloc
+#include <string.h>     // for strlen, strncmp, strcmp, strndup
+#include <strings.h>    // for strcasecmp
+#include <sys/socket.h> // for AF_INET, sockaddr
+#include <time.h>       // for strftime, localtime, time
 
 #include "database.h"
-#include "lua_registry.h"
+#include "library.h"
 #include "server.h"
 
 struct MHD_Connection;
 
-const struct luaL_Reg lua_lib[] = {{"query_db", query_db},
-                                   {"execute_cmd", execute_cmd},
-                                   {"render_tmpl", render_tmpl},
-                                   {"http_request", http_request},
-                                   {"base64enc", base64enc},
-                                   {"base64dec", base64dec},
-                                   {NULL, NULL}};
-
-enum ContentType {
-  CT_OTHER = 0,
-  CT_URLENCODED = 1,
-  CT_MULTIPART = 2,
-  CT_JSON = 3
+struct server_info {
+  magic_t magic_db;
 };
 
-struct connection_info {
-  enum ContentType content_type;
-  lua_State *L;
-  const char *scheme;
-  const char *host;
-  const char *method;
-  const char *path;
-  bool parse_body;
-  struct MHD_PostProcessor *postprocessor;
-  struct resource *resource;
-  unsigned int status;
-};
-
-static enum MHD_Result collect_header(void *cls, enum MHD_ValueKind kind,
-                                      const char *key, const char *value) {
+static enum MHD_Result parse_header(void *cls, enum MHD_ValueKind kind,
+                                    const char *key, const char *value) {
   struct connection_info *con_info = cls;
 
   if (strcasecmp(key, "Host") == 0) {
     if (con_info->host == NULL)
       con_info->host = value;
+  } else if (strcasecmp(key, "Referer") == 0) {
+    con_info->referer = value;
+  } else if (strcasecmp(key, "User-Agent") == 0) {
+    con_info->agent = value;
   } else if (strcasecmp(key, "X-Forwarded-Host") == 0) {
     con_info->host = value;
   } else if (strcasecmp(key, "X-Forwarded-Proto") == 0) {
     con_info->scheme = value;
+  } else if (strcasecmp(key, "X-Forwarded-For") == 0) {
+    con_info->remote = value;
   } else if (strcasecmp(key, "Content-Type") == 0) {
     if (strncmp(value, "application/x-www-form-urlencoded",
                 strlen("application/x-www-form-urlencoded")) == 0) {
@@ -89,6 +75,12 @@ static enum MHD_Result collect_header(void *cls, enum MHD_ValueKind kind,
     }
   }
 
+  return MHD_YES;
+}
+
+static enum MHD_Result push_header(void *cls, enum MHD_ValueKind kind,
+                                   const char *key, const char *value) {
+  struct connection_info *con_info = cls;
   pushtableliteral(con_info->L, key, value);
   return MHD_YES;
 }
@@ -137,7 +129,7 @@ static void build_context(struct MHD_Connection *conn,
 
   lua_pushliteral(L, "headers");
   lua_newtable(L);
-  MHD_get_connection_values(conn, MHD_HEADER_KIND, &collect_header, con_info);
+  MHD_get_connection_values(conn, MHD_HEADER_KIND, &push_header, con_info);
   lua_settable(L, -3);
 
   lua_pushliteral(L, "params");
@@ -153,12 +145,20 @@ static void build_context(struct MHD_Connection *conn,
   pushtableliteral(L, "host", con_info->host);
   pushtableliteral(L, "method", con_info->method);
   pushtableliteral(L, "path", con_info->path);
-  pushtablestring(L, "slug", resource->slug);
+  pushtableliteral(L, "slug", resource->slug);
   pushtablestring(L, "srcpath", resource->srcpath);
-  pushtablestring(L, "name", resource->name);
+  pushtableliteral(L, "name", resource->name);
   pushtablelstring(L, "content", resource->content, resource->size);
-  pushtablestring(L, "ctime", resource->ctime);
-  pushtablestring(L, "mtime", resource->mtime);
+  if (resource->ctime > 0) {
+    char *ctime = parse_time(resource->ctime);
+    pushtablestring(L, "ctime", ctime);
+    free(ctime);
+  }
+  if (resource->mtime > 0) {
+    char *mtime = parse_time(resource->mtime);
+    pushtablestring(L, "mtime", mtime);
+    free(mtime);
+  }
   pushtableint(L, "status", con_info->status);
 
   lua_pushliteral(L, "tags");
@@ -173,73 +173,82 @@ static void build_context(struct MHD_Connection *conn,
   lua_settable(L, -3);
 }
 
-static int prepare_lua_resource(lua_State *L, sqlite3 *db,
-                                struct resource *res) {
-  char lua_code[res->size + 1];
-  memcpy(lua_code, res->content, sizeof(lua_code));
-  lua_code[res->size] = '\0';
-
-  int rc = luaL_dostring(L, lua_code);
+static int prepare_lua_resource(struct server_info *srv_info,
+                                struct connection_info *con_info) {
+  int rc = luaL_dostring(con_info->L, con_info->resource->content);
   if (rc != LUA_OK) {
-    syslog(LOG_ERR, "Failed evaluating Lua code: %s", lua_tostring(L, -1));
+    fprintf(stderr, "Failed evaluating Lua code: %s\n",
+            lua_tostring(con_info->L, -1));
+    lua_pop(con_info->L, 1);
     return rc;
   }
   // stack: [context, resource_lua]
 
-  lua_insert(L, 1);
+  lua_insert(con_info->L, 1);
   // stack: [resource_lua, context]
 
-  if (lua_getglobal(L, "render") != LUA_TFUNCTION) {
-    syslog(LOG_ERR, "Failed getting resource's render function, it is %s",
-           lua_typename(L, lua_type(L, -1)));
+  if (lua_getglobal(con_info->L, "render") != LUA_TFUNCTION) {
+    fprintf(stderr, "Failed getting resource's render function, it is %s\n",
+            lua_typename(con_info->L, lua_type(con_info->L, -1)));
     return 1;
   }
-  lua_insert(L, 2);
+  lua_insert(con_info->L, 2);
   // stack: [resource_lua, render, context]
 
-  luaL_newlib(L, lua_lib);
-  lua_insert(L, 3);
-  // stack: [resource_lua, render, sheepwool, context]
-
-  lua_pushlightuserdata(L, db);
-  lua_insert(L, 4);
-  // stack: [resource_lua, render, sheepwool, db, context]
+  lua_newtable(con_info->L);
+  pushtableclosure(con_info->L, "list_resources", list_resources, 0);
+  pushtableclosure(con_info->L, "query_db", query_db, 1, con_info->db);
+  pushtableclosure(con_info->L, "execute_cmd", execute_cmd, 0);
+  pushtableclosure(con_info->L, "render_tmpl", render_tmpl, 1, con_info);
+  pushtableclosure(con_info->L, "http_request", http_request, 0);
+  pushtableclosure(con_info->L, "base64enc", base64enc, 0);
+  pushtableclosure(con_info->L, "base64dec", base64dec, 0);
+  lua_insert(con_info->L, 3);
+  // stack: [resource_lua, render, sheepwool_lib, context]
 
   return 0;
 }
 
-static int render_resource(sqlite3 *db, struct MHD_Connection *conn,
+static int render_resource(struct server_info *srv_info,
+                           struct MHD_Connection *conn,
                            struct connection_info *con_info) {
-  if (strcmp(con_info->resource->mime, "text/html") == 0 &&
-      con_info->resource->tmpl != NULL) {
-    lua_pushlightuserdata(con_info->L, db);
-    lua_insert(con_info->L, 1);
+  if (strcmp(con_info->resource->mime, "text/html") == 0) {
     lua_pushstring(con_info->L, con_info->resource->tmpl);
-    lua_insert(con_info->L, 2);
+    lua_insert(con_info->L, 1);
+    lua_pushlightuserdata(con_info->L, con_info);
     render_tmpl(con_info->L);
     size_t size = 0;
-    con_info->resource->content =
-        sqlite3_mprintf("%s", lua_tolstring(con_info->L, -1, &size));
+    const char *content = lua_tolstring(con_info->L, -1, &size);
+    con_info->resource->content = strndup(content, size);
     con_info->resource->size = size;
   } else if (strcmp(con_info->resource->mime, "text/x-lua") == 0) {
-    int rc = prepare_lua_resource(con_info->L, db, con_info->resource);
+    int rc = prepare_lua_resource(srv_info, con_info);
     if (rc)
       return rc;
-    //
-    // stack: [con_info->resource_lua, render, sheepwool, db, context]
-    rc = lua_pcall(con_info->L, 3, 2, 0);
+
+    if (lua_gettop(con_info->L) == 3)
+      lua_newtable(con_info->L);
+
+    // stack: [con_info->resource_lua, render, sheepwool, context]
+    if (lua_gettop(con_info->L) == 5) {
+      // assume value at top of stack is an error, push it into context
+      lua_pushliteral(con_info->L, "error");
+      lua_insert(con_info->L, 5);
+      lua_settable(con_info->L, 4);
+    }
+
+    rc = lua_pcall(con_info->L, 2, 2, 0);
     if (rc != LUA_OK) {
-      syslog(LOG_ERR, "Failed rendering Lua con_info->resource: %s (code: %d)",
-             lua_tostring(con_info->L, -1), rc);
+      fprintf(stderr, "Failed rendering Lua resource: %s (code: %d)\n",
+              lua_tostring(con_info->L, -1), rc);
       return rc;
     }
     // stack: [con_info->resource_lua, mime, content]
 
-    con_info->resource->mime =
-        sqlite3_mprintf("%s", lua_tostring(con_info->L, -2));
+    con_info->resource->mime = lua_tostring(con_info->L, -2);
     size_t size = 0;
-    con_info->resource->content =
-        sqlite3_mprintf("%s", lua_tolstring(con_info->L, -1, &size));
+    const char *content = lua_tolstring(con_info->L, -1, &size);
+    con_info->resource->content = strndup(content, size);
     con_info->resource->size = size;
   }
 
@@ -277,7 +286,8 @@ static void request_completed(void *cls, struct MHD_Connection *connection,
 
   lua_close(con_info->L);
   free_resource(con_info->resource);
-  free(con_info->resource);
+  if (con_info->db != NULL)
+    sqlite_disconnect(con_info->db);
   free(con_info);
   *con_cls = NULL;
 }
@@ -286,21 +296,22 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
                                   const char *path, const char *method,
                                   const char *version, const char *upload_data,
                                   size_t *upload_data_size, void **con_cls) {
-  sqlite3 *db = cls;
+  struct server_info *srv_info = cls;
 
   if (*con_cls == NULL) {
-    syslog(LOG_DEBUG, "New %s request for %s using %s\n", method, path,
-           version);
+    fprintf(stderr, "New %s request for %s using %s\n", method, path, version);
 
     struct connection_info *con_info = malloc(sizeof(struct connection_info));
     if (con_info == NULL)
       return MHD_NO;
 
-    con_info->resource = malloc(sizeof(struct resource));
-    if (con_info->resource == NULL)
-      return MHD_NO;
-
+    con_info->magic_db = srv_info->magic_db;
+    con_info->is_localhost = false;
+    con_info->resource = NULL;
     con_info->host = NULL;
+    con_info->remote = NULL;
+    con_info->referer = "-";
+    con_info->agent = "";
     con_info->scheme = "http";
     con_info->content_type = CT_OTHER;
     con_info->postprocessor = NULL;
@@ -308,18 +319,39 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
     con_info->path = path;
     con_info->status = 0;
     con_info->parse_body = false;
+
     con_info->L = luaL_newstate();
     luaL_openlibs(con_info->L);
 
-    int rc = load_resource(db, con_info->resource, path);
+    MHD_get_connection_values(conn, MHD_HEADER_KIND, &parse_header, con_info);
 
-    if (rc == SQLITE_OK) {
-      if (con_info->resource->status == GONE) {
-        con_info->status = MHD_HTTP_GONE;
-      } else if (con_info->resource->status == MOVED) {
-        con_info->status = MHD_HTTP_MOVED_PERMANENTLY;
-      }
+    if (con_info->host == NULL ||
+        str_starts_with(con_info->host, "localhost") ||
+        str_starts_with(con_info->host, "0.0.0.0") ||
+        str_starts_with(con_info->host, "127.0.0.1"))
+      con_info->is_localhost = true;
 
+    char *dbpath =
+        get_abspath(con_info->host, con_info->is_localhost, "/db.sqlite3");
+    if (dbpath == NULL)
+      return MHD_NO;
+
+    int rc = sqlite_connect(&con_info->db, dbpath, false);
+    if (rc)
+      return MHD_NO;
+
+    const union MHD_ConnectionInfo *ci =
+        MHD_get_connection_info(conn, MHD_CONNECTION_INFO_CLIENT_ADDRESS);
+    if (ci != NULL && ci->client_addr->sa_family == AF_INET) {
+      struct sockaddr_in *in = (struct sockaddr_in *)ci->client_addr;
+      con_info->remote = inet_ntoa(in->sin_addr);
+    }
+
+    con_info->resource = load_resource(con_info, path);
+
+    if (con_info->resource == NULL) {
+      con_info->status = MHD_HTTP_NOT_FOUND;
+    } else {
       build_context(conn, con_info);
 
       if ((strcasecmp(con_info->method, MHD_HTTP_METHOD_POST) == 0 ||
@@ -338,14 +370,6 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
           free(con_info);
           return MHD_NO;
         }
-      }
-    } else {
-      if (rc == SQLITE_NOTFOUND) {
-        con_info->status = MHD_HTTP_NOT_FOUND;
-      } else {
-        syslog(LOG_ERR, "Failed loading resource %s: %s", path,
-               sqlite3_errstr(rc));
-        con_info->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
       }
     }
 
@@ -366,8 +390,10 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
       }
 
       if (MHD_post_process(con_info->postprocessor, upload_data,
-                           *upload_data_size) != MHD_YES)
+                           *upload_data_size) != MHD_YES) {
+        fprintf(stderr, "Failed post processing\n");
         con_info->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
+      }
 
       *upload_data_size = 0;
 
@@ -375,19 +401,30 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
     }
   }
 
-  if (con_info->status == 0)
-    con_info->status = MHD_HTTP_OK;
-
-  int rc = con_info->status >= 400
-               ? load_resource(db, con_info->resource, "/error") ||
-                     render_resource(db, conn, con_info)
-               : render_resource(db, conn, con_info);
-
-  if (rc != SQLITE_OK) {
-    con_info->resource->mime = sqlite3_mprintf("text/plain");
-    con_info->resource->content = sqlite3_mprintf("Error %d", con_info->status);
-    con_info->resource->size = strlen(con_info->resource->content);
+  if (con_info->status == 0) {
+    int rc = render_resource(srv_info, conn, con_info);
+    if (rc)
+      con_info->status = 500;
   }
+
+  if (con_info->status) {
+    if (con_info->resource)
+      free_resource(con_info->resource);
+    con_info->resource = load_resource(con_info, "/error");
+    if (con_info->resource) {
+      int rc = render_resource(srv_info, conn, con_info);
+      if (rc) {
+        free_resource(con_info->resource);
+        con_info->resource =
+            error_resource(path, MHD_HTTP_INTERNAL_SERVER_ERROR);
+      }
+    } else {
+      con_info->resource = error_resource(path, MHD_HTTP_INTERNAL_SERVER_ERROR);
+    }
+  }
+
+  con_info->status =
+      con_info->resource->status ? con_info->resource->status : MHD_HTTP_OK;
 
   struct MHD_Response *response = MHD_create_response_from_buffer(
       con_info->resource->size, (void *)con_info->resource->content,
@@ -400,6 +437,21 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
 
   enum MHD_Result ret = MHD_queue_response(conn, con_info->status, response);
 
+  size_t max_date_size = strlen("18/Sep/2011:19:18:28 -0400") + 6;
+  char *date = malloc(max_date_size);
+  time_t now = time(NULL);
+  if (now != -1) {
+    struct tm *nowinfo = localtime(&now);
+    strftime(date, max_date_size, "%d/%b/%Y:%T %z", nowinfo);
+  } else {
+    snprintf(date, max_date_size, "unknown");
+  }
+  fprintf(stdout, "%s %s - - [%s] \"%s %s %s\" %d %d \"%s\" \"%s\"\n",
+          con_info->host, con_info->remote, date, method, path, version,
+          con_info->status, con_info->resource->size, con_info->referer,
+          con_info->agent);
+  free(date);
+
   MHD_destroy_response(response);
 
   return ret;
@@ -408,27 +460,49 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
 static volatile sig_atomic_t keep_running = 1;
 
 static void sig_handler(int _) {
-    (void)_;
-    keep_running = 0;
+  (void)_;
+  keep_running = 0;
 }
 
-int serve(sqlite3 *db, unsigned int port, char *logpath) {
+int serve(unsigned int port) {
   signal(SIGINT, sig_handler);
+
+  struct server_info *srv_info = malloc(sizeof(struct server_info));
+  srv_info->magic_db = magic_open(MAGIC_MIME_TYPE);
+  if (srv_info->magic_db == NULL) {
+    fprintf(stderr, "Failed opening libmagic cookie: %s\n", strerror(errno));
+    goto cleanup;
+  }
+
+  if (magic_load(srv_info->magic_db, NULL) != 0) {
+    fprintf(stderr, "Failed loading libmagic DB: %s\n",
+            magic_error(srv_info->magic_db));
+    goto cleanup;
+  }
+
+  int rc = 0;
 
   struct MHD_Daemon *daemon = MHD_start_daemon(
       MHD_USE_AUTO | MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG, port,
-      NULL, NULL, &handle_req, db, MHD_OPTION_NOTIFY_COMPLETED,
+      NULL, NULL, &handle_req, srv_info, MHD_OPTION_NOTIFY_COMPLETED,
       &request_completed, NULL, MHD_OPTION_END);
-  if (daemon == NULL)
-    return 1;
+  if (daemon == NULL) {
+    rc = 1;
+    goto cleanup;
+  }
 
-  syslog(LOG_INFO, "Server is listening on 0.0.0.0:%d", port);
+  fprintf(stderr, "Server is listening on 0.0.0.0:%d\n", port);
 
   while (keep_running)
     (void)0;
 
-  syslog(LOG_INFO, "Shutting down server");
+  fprintf(stderr, "Shutting down server\n");
   MHD_stop_daemon(daemon);
 
-  return 0;
+cleanup:
+  if (srv_info->magic_db != NULL)
+    magic_close(srv_info->magic_db);
+  free(srv_info);
+
+  return rc;
 }

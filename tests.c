@@ -614,9 +614,3 @@ int main(void) {
   return waitpid(WAIT_ANY, &st, WNOHANG) != -1;
 }
 #endif /* TEST_WAIT_ANY */
-#if TEST_INOTIFYTOOLS
-#include <inotifytools/inotify.h>
-#include <inotifytools/inotifytools.h>
-
-int main(void) { return inotifytools_initialize() == 1; }
-#endif /* TEST_INOTIFYTOOLS */

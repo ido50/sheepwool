@@ -89,7 +89,6 @@ LDADD_MD5=
 LDADD_SHA2=
 LDADD_LIB_SOCKET=
 LDADD_STATIC=
-LDADD_INOTIFYTOOLS=
 CPPFLAGS=
 LDFLAGS=
 DESTDIR=
@@ -189,7 +188,6 @@ HAVE_FTS=
 HAVE_GETEXECNAME=
 HAVE_GETPROGNAME=
 HAVE_INFTIM=
-HAVE_INOTIFYTOOLS=
 HAVE_LANDLOCK=
 HAVE_MD5=
 HAVE_MEMMEM=
@@ -354,7 +352,6 @@ runtest crypt_newhash	CRYPT_NEWHASH		  	  || true
 runtest endian_h	ENDIAN_H			  || true
 runtest err		ERR				  || true
 runtest explicit_bzero	EXPLICIT_BZERO			  || true
-runtest inotifytools		INOTIFYTOOLS "" "" "-linotifytools"				  || true
 runtest fts		FTS				  || true
 runtest getexecname	GETEXECNAME			  || true
 runtest getprogname	GETPROGNAME			  || true
@@ -517,7 +514,6 @@ cat << __HEREDOC__
 #define HAVE_ENDIAN_H ${HAVE_ENDIAN_H}
 #define HAVE_ERR ${HAVE_ERR}
 #define HAVE_EXPLICIT_BZERO ${HAVE_EXPLICIT_BZERO}
-#define HAVE_INOTIFYTOOLS ${HAVE_INOTIFYTOOLS}
 #define HAVE_FTS ${HAVE_FTS}
 #define HAVE_GETEXECNAME ${HAVE_GETEXECNAME}
 #define HAVE_GETPROGNAME ${HAVE_GETPROGNAME}
@@ -2437,7 +2433,6 @@ LDADD_LIB_SOCKET = ${LDADD_LIB_SOCKET}
 LDADD_MD5	 = ${LDADD_MD5}
 LDADD_SHA2	 = ${LDADD_SHA2}
 LDADD_STATIC	 = ${LDADD_STATIC}
-LDADD_INOTIFYTOOLS = ${LDADD_INOTIFYTOOLS}
 LDFLAGS		 = ${LDFLAGS}
 STATIC		 = ${STATIC}
 PREFIX		 = ${PREFIX}

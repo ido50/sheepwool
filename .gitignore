@@ -7,7 +7,6 @@ pid-file
 .ccls-cache
 *.old
 vgcore*
-*.db
-*.db-shm
-*.db-wal
+*.sqlite3-shm
+*.sqlite3-wal
 *.core

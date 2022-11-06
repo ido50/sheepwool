@@ -14,13 +14,11 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-#include <sqlite3.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <syslog.h>
+#include <sqlite3.h> // for sqlite3_errstr, sqlite3, sqlite3_stmt, sqlite3_...
+#include <stdarg.h>  // for va_list, va_end, va_start, va_arg
+#include <stdbool.h> // for bool
+#include <stdio.h>   // for fprintf, stderr, NULL
+#include <stdlib.h>  // for free, malloc
 
 #include "database.h"
 
@@ -67,7 +65,7 @@ static int sqlite_init(sqlite3 *db, bool read_only) {
     int rc = execute(db, stmts[i]);
     if (rc) {
       if (i > 5) {
-        syslog(LOG_ERR, "Rolling back init transaction");
+        fprintf(stderr, "Rolling back init transaction\n");
         execute(db, "ROLLBACK");
       }
       return rc;
@@ -78,16 +76,14 @@ static int sqlite_init(sqlite3 *db, bool read_only) {
 }
 
 int sqlite_connect(sqlite3 **db, char *dbpath, bool read_only) {
-  syslog(LOG_DEBUG, "Connecting to database %s", dbpath);
-
   int rc =
       sqlite3_open_v2(dbpath, db,
                       read_only ? SQLITE_OPEN_READONLY
                                 : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
                       NULL);
   if (rc) {
-    syslog(LOG_ERR, "Failed connecting to database %s: %s", dbpath,
-           sqlite3_errstr(rc));
+    fprintf(stderr, "Failed connecting to database %s: %s\n", dbpath,
+            sqlite3_errstr(rc));
     goto cleanup;
   }
 
@@ -95,7 +91,7 @@ int sqlite_connect(sqlite3 **db, char *dbpath, bool read_only) {
 
   rc = sqlite_init(*db, read_only);
   if (rc) {
-    syslog(LOG_ERR, "Database initialization failed, exiting");
+    fprintf(stderr, "Database initialization failed, exiting\n");
     goto cleanup;
   }
 
@@ -105,10 +101,7 @@ cleanup:
   return rc;
 }
 
-int sqlite_disconnect(sqlite3 *db) {
-  syslog(LOG_DEBUG, "Disconnecting from database");
-  return sqlite3_close(db);
-}
+int sqlite_disconnect(sqlite3 *db) { return sqlite3_close(db); }
 
 struct bind_param sqlite_bind(int type, int int_value, double double_value,
                               char *char_value, unsigned long size) {
@@ -159,8 +152,8 @@ static int prepare_va(sqlite3 *db, sqlite3_stmt **stmt, const char *sql,
                       va_list *params) {
   int rc = sqlite3_prepare_v2(db, sql, -1, stmt, NULL);
   if (rc) {
-    syslog(LOG_ERR, "Failed preparing statement: %s (code: %d)",
-           sqlite3_errstr(rc), rc);
+    fprintf(stderr, "Failed preparing statement: %s (code: %d)\n",
+            sqlite3_errstr(rc), rc);
     return rc;
   }
 
@@ -179,7 +172,7 @@ static int prepare_va(sqlite3 *db, sqlite3_stmt **stmt, const char *sql,
 
     rc = bind_params(stmt, num_params, params_array);
     if (rc) {
-      syslog(LOG_ERR, "Failed binding parameters: %s", sqlite3_errstr(rc));
+      fprintf(stderr, "Failed binding parameters: %s\n", sqlite3_errstr(rc));
     }
 
     free(params_array);
@@ -210,8 +203,8 @@ int execute(sqlite3 *db, const char *sql, ...) {
 
   rc = sqlite3_step(stmt);
   if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
-    syslog(LOG_ERR, "Failed executing statement: %s (code: %d)",
-           sqlite3_errstr(rc), rc);
+    fprintf(stderr, "Failed executing statement: %s (code: %d)\n",
+            sqlite3_errstr(rc), rc);
     goto cleanup;
   }
 
@@ -221,113 +214,4 @@ cleanup:
   sqlite3_finalize(stmt);
 
   return rc;
-}
-
-static char *get_nullable_text(sqlite3_stmt *stmt, int col_num) {
-  if (sqlite3_column_type(stmt, col_num) == SQLITE_NULL) {
-    return NULL;
-  }
-
-  return sqlite3_mprintf("%s", sqlite3_column_text(stmt, col_num));
-}
-
-static void *get_nullable_blob(sqlite3_stmt *stmt, int col_num) {
-  if (sqlite3_column_type(stmt, col_num) == SQLITE_NULL) {
-    return NULL;
-  }
-
-  const char *blob = sqlite3_column_blob(stmt, col_num);
-  int blob_size = sqlite3_column_bytes(stmt, col_num);
-  char *dest = sqlite3_malloc(blob_size);
-  memcpy(dest, blob, blob_size);
-
-  return dest;
-}
-
-int load_resource(sqlite3 *db, struct resource *res, const char *slug) {
-  sqlite3_stmt *stmt;
-  int rc = prepare(
-      db, &stmt,
-      "    SELECT r.slug, r.srcpath, r.name, r.mime, r.status, r.content,"
-      "           r.size, r.template, r.moved_to, r.ctime, r.mtime,"
-      "           group_concat(t.tag) AS tags"
-      "      FROM resources r"
-      " LEFT JOIN tags t ON t.slug = r.slug"
-      "     WHERE r.slug = ? AND r.status != ?"
-      "  GROUP BY r.slug",
-      sqlite_bind(SQLITE_TEXT, 0, 0, (char *)slug, 0),
-      sqlite_bind(SQLITE_INTEGER, UNPUB, 0, NULL, 0));
-  if (rc) {
-    syslog(LOG_ERR, "Failed preparing resource loading statement: %s",
-           sqlite3_errstr(rc));
-    goto cleanup;
-  }
-
-  rc = sqlite3_step(stmt);
-  if (rc != SQLITE_ROW) {
-    rc = SQLITE_NOTFOUND;
-    goto cleanup;
-  }
-
-  rc = 0;
-
-  const unsigned char *rslug = sqlite3_column_text(stmt, 0);
-  if (strcmp((char *)rslug, "") == 0) {
-    rc = SQLITE_NOTFOUND;
-    goto cleanup;
-  }
-
-  res->slug = sqlite3_mprintf("%s", rslug);
-  res->srcpath = get_nullable_text(stmt, 1);
-  res->name = get_nullable_text(stmt, 2);
-  res->mime = get_nullable_text(stmt, 3);
-  res->status = sqlite3_column_int(stmt, 4);
-  res->content = get_nullable_blob(stmt, 5);
-  res->size = sqlite3_column_int(stmt, 6);
-  res->tmpl = get_nullable_text(stmt, 7);
-  res->moved_to = get_nullable_text(stmt, 8);
-  res->ctime = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 9));
-  res->mtime = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 10));
-  res->baseurl = NULL;
-  res->tags = NULL;
-  char *tags = get_nullable_text(stmt, 11);
-  if (tags != NULL) {
-    char *tag = strtok(tags, ",");
-    int i = 0;
-    while (tag) {
-      // we are allocating enough memory for the tags, plus a NULL sentinel
-      if (i)
-        res->tags = sqlite3_realloc(res->tags, sizeof(res->tags) * (i + 2));
-      else
-        res->tags = sqlite3_malloc(sizeof(res->tags) * 2);
-      res->tags[i] = tag;
-      tag = strtok(NULL, ",");
-      i++;
-    }
-    res->tags[i] = NULL;
-  }
-  res->owned = true;
-
-cleanup:
-  sqlite3_finalize(stmt);
-
-  return rc;
-}
-
-void free_resource(struct resource *res) {
-  if (!res->owned)
-    return;
-
-  sqlite3_free(res->slug);
-  sqlite3_free(res->srcpath);
-  sqlite3_free(res->name);
-  sqlite3_free(res->mime);
-  sqlite3_free(res->content);
-  sqlite3_free(res->tmpl);
-  sqlite3_free(res->moved_to);
-  sqlite3_free(res->ctime);
-  sqlite3_free(res->mtime);
-  sqlite3_free(res->tags);
-  sqlite3_free(res->baseurl);
-  res->owned = false;
 }
