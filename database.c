@@ -23,7 +23,7 @@
 #include "database.h"
 
 static int sqlite_init(sqlite3 *db, bool read_only) {
-  int num_cmds = read_only ? 3 : 11;
+  int num_cmds = read_only ? 3 : 5;
 
   const char *stmts[num_cmds];
   stmts[0] = "PRAGMA encoding = 'UTF-8'";
@@ -33,41 +33,11 @@ static int sqlite_init(sqlite3 *db, bool read_only) {
   if (!read_only) {
     stmts[3] = "PRAGMA application_id = 'sheepwool'";
     stmts[4] = "PRAGMA secure_delete = 1";
-    stmts[5] = "BEGIN";
-    stmts[6] = "CREATE TABLE IF NOT EXISTS vars ("
-               "    key             TEXT PRIMARY KEY,"
-               "    value           ANY NOT NULL"
-               ")";
-    stmts[7] = "CREATE TABLE IF NOT EXISTS resources ("
-               "    slug      TEXT PRIMARY KEY,"
-               "    srcpath   TEXT,"
-               "    mime      TEXT,"
-               "    name      TEXT,"
-               "    status    INT NOT NULL,"
-               "    content   BLOB,"
-               "    size      INT NOT NULL DEFAULT 0,"
-               "    template  TEXT,"
-               "    moved_to  TEXT,"
-               "    ctime     TEXT,"
-               "    mtime     TEXT"
-               ")";
-    stmts[8] = "CREATE TABLE IF NOT EXISTS tags ("
-               "    slug      TEXT NOT NULL,"
-               "    tag       TEXT NOT NULL,"
-               "    PRIMARY KEY (slug, tag)"
-               ")";
-    stmts[9] =
-        "CREATE INDEX IF NOT EXISTS resource_status ON resources(status)";
-    stmts[10] = "COMMIT";
   }
 
   for (int i = 0; i < num_cmds; i++) {
     int rc = execute(db, stmts[i]);
     if (rc) {
-      if (i > 5) {
-        fprintf(stderr, "Rolling back init transaction\n");
-        execute(db, "ROLLBACK");
-      }
       return rc;
     }
   }

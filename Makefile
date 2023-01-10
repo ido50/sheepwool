@@ -3,7 +3,7 @@
 include Makefile.configure
 
 LDADD_STATIC    =
-BINDIR          = /var/www/cgi-bin
+BINDIR          = /usr/local/bin
 OBJS            = compats.o database.o library.o server.o main.o
 DEPS_PKG        = sqlite3 lua53 libmagic libsass libcurl libmicrohttpd tidy
 STATIC_PKG     != [ -z "$(LDADD_STATIC)" ] || echo "--static"

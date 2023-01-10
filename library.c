@@ -78,33 +78,38 @@ bool str_starts_with(const char *str, const char *start) {
 char *get_abspath(const char *host, bool is_localhost, const char *path) {
   int len_prefix = 2; // length of ./ prefix
   int len_path = strlen(path);
-  long unsigned int len = len_prefix + len_path + 1;
+  int len = len_prefix + len_path + 1; // 1 for NULL terminator
 
   // if path has a trailing slash, remove it
   if (len_path > 1 && path[len_path - 1] == '/')
     len -= 1;
 
+  char *buffer = NULL;
+  int ret = 0;
+
   if (is_localhost) {
-    // account for removing the heading slash, unless path is /
-    if (strcmp(path, "/") != 0)
+    // remove heading slash
+    if (path[0] == '/') {
       len -= 1;
+      path = path + 1;
+    }
+
+    buffer = malloc((size_t)((unsigned)len));
+    ret = snprintf(buffer, len, "./%s", path);
   } else {
     // account for the host
     len += strlen(host);
+
+    // we need a heading slash when we have a host
+    if (path[0] != '/')
+      len++;
+
+    buffer = malloc(len);
+    ret = path[0] == '/' ? snprintf(buffer, len, "./%s%s", host, path)
+                         : snprintf(buffer, len, "./%s/%s", host, path);
   }
 
-  char *buffer = malloc(len);
-  int ret = 0;
-  if (is_localhost)
-    ret = snprintf(buffer, len, "./%s", path + 1);
-  else
-    ret = snprintf(buffer, len, "./%s%s", host, path);
-
-  if (ret < 0 || (size_t)ret >= len) {
-    fprintf(
-        stderr,
-        "Joining path %s in host %s yielded wrong size: got %d, expected %lo\n",
-        path, host, ret, len);
+  if (ret < 0) {
     free(buffer);
     return NULL;
   }
@@ -114,9 +119,18 @@ char *get_abspath(const char *host, bool is_localhost, const char *path) {
 
 static char *dup_and_push(char *source, const char *addition) {
   char *dup = strdup(source);
-  dup = realloc(dup, strlen(dup) + strlen(addition));
-  strcat(dup, addition);
+  if (source[strlen(source) - 1] == '/') {
+    dup = realloc(dup, strlen(dup) + strlen(addition));
+    strcat(dup, addition + 1);
+  } else {
+    dup = realloc(dup, strlen(dup) + strlen(addition) + 1);
+    strcat(dup, addition);
+  }
   return dup;
+}
+
+static char *slugify(lua_State *L, char *orig) {
+  return replace(L, (char *)orig, "%.html$", "");
 }
 
 char *parse_time(time_t time) {
@@ -243,7 +257,7 @@ static int open_etlua(lua_State *L) {
 
 static char *tidy_html(const char *input) {
   TidyBuffer buf = {0};
-  char *output;
+  char *output = NULL;
   int rc = -1;
 
   TidyDoc tdoc = tidyCreate();
@@ -291,8 +305,15 @@ struct list_options {
 };
 
 int list_resources(lua_State *L) {
+  struct connection_info *con_info =
+      (struct connection_info *)lua_touserdata(L, lua_upvalueindex(1));
+
   // stack: [dirpath, opts]
   const char *dirpath = lua_tostring(L, 1);
+  char *fullpath = get_abspath(con_info->host, con_info->is_localhost, dirpath);
+
+  if (fullpath == NULL)
+    return luaL_error(L, "Failed getting real path from %s", dirpath);
 
   if (lua_gettop(L) == 1)
     lua_newtable(L);
@@ -304,10 +325,13 @@ int list_resources(lua_State *L) {
 
   int rc = 0;
 
-  DIR *dir = opendir(dirpath);
-  if (dir == NULL)
-    return luaL_error(L, "Failed opening directory %s: %s", dirpath,
-                      strerror(errno));
+  DIR *dir = opendir(fullpath);
+  if (dir == NULL) {
+    rc = 1;
+    lua_pushfstring(L, "Failed opening directory %s: %s", fullpath,
+                    strerror(errno));
+    goto cleanup;
+  }
 
   // create a table that will hold the results
   lua_newtable(L);
@@ -336,9 +360,9 @@ int list_resources(lua_State *L) {
     FILE *fp = NULL;
     char *line = NULL;
 
-    size_t filepath_size = strlen(dirpath) + strlen(entry->d_name) + 2;
+    size_t filepath_size = strlen(fullpath) + strlen(entry->d_name) + 2;
     filepath = malloc(filepath_size);
-    rc = snprintf(filepath, filepath_size, "%s/%s", dirpath, entry->d_name);
+    rc = snprintf(filepath, filepath_size, "%s/%s", fullpath, entry->d_name);
     if (rc == -1) {
       lua_pushfstring(L, "Failed joining path: %s", strerror(errno));
       goto loopcleanup;
@@ -352,7 +376,24 @@ int list_resources(lua_State *L) {
     }
 
     lua_createtable(L, 0, 5);
-    pushtablestring(L, "slug", filepath);
+    if (con_info->is_localhost) {
+      size_t len = strlen(filepath) - 2; // -2 for ./
+      char *slug = malloc(len + 1);
+      memcpy(slug, filepath + 2, len);
+      slug[len] = '\0';
+      pushtablestring(L, "slug", slug);
+      free(slug);
+    } else {
+      size_t host_len =
+          strlen(con_info->host) + 3; // 2 for heading ./, 1 for trailing /
+      size_t len = strlen(filepath) - host_len;
+      char *slug = malloc(len + 1);
+      memcpy(slug, filepath + host_len, len + 1);
+      slug[len] = '\0';
+      pushtablestring(L, "slug", slug);
+      free(slug);
+    }
+
     pushtablestring(L, "name", entry->d_name);
     char *ctime = parse_time(fstat.st_ctime);
     pushtablestring(L, "ctime", ctime);
@@ -369,9 +410,9 @@ int list_resources(lua_State *L) {
     // stack: [dirpath, ext, results, libstring, resource]
 
     if (match(L, entry->d_name, "%.html$")) {
-      char *slug = replace(L, filepath, "%.html$", "");
-      pushtablestring(L, "slug", slug);
-      free(slug);
+      char *new_slug = slugify(L, (char *)gettablestring(L, 5, "slug"));
+      pushtablestring(L, "slug", new_slug);
+      free(new_slug);
 
       fp = fopen(filepath, "r");
       if (fp == NULL) {
@@ -450,6 +491,7 @@ int list_resources(lua_State *L) {
 cleanup:
   if (dir)
     closedir(dir);
+  free(fullpath);
   if (rc)
     return lua_error(L);
 
@@ -526,7 +568,7 @@ int render_tmpl(lua_State *L) {
     break;
   }
 
-  lua_pushstring(L, tidy_html(lua_tostring(L, -1)));
+  lua_pushstring(L, lua_tostring(L, -1));
   lua_replace(L, -2);
 
 cleanup:
@@ -942,8 +984,6 @@ static int parse_html(lua_State *L, struct resource *res, char *abspath) {
     const char *key = lua_tostring(L, -2);
     const char *value = lua_tostring(L, -1);
 
-    fprintf(stderr, "key=%s, value=%s\n", key, value);
-
     if (strcmp(key, "name") == 0) {
       if (res->name != NULL)
         free(res->name);
@@ -974,6 +1014,14 @@ static int parse_html(lua_State *L, struct resource *res, char *abspath) {
         i++;
       }
       res->tags[i] = NULL;
+    } else if (strcmp(key, "ctime") == 0) {
+      struct tm ctime;
+      if (strptime(value, "%Y-%m-%dT%T", &ctime) != NULL)
+        res->ctime = mktime(&ctime);
+    } else if (strcmp(key, "mtime") == 0) {
+      struct tm mtime;
+      if (strptime(value, "%Y-%m-%dT%T", &mtime) != NULL)
+        res->mtime = mktime(&mtime);
     }
 
     lua_pop(L, 2);
@@ -1056,6 +1104,9 @@ struct resource *load_resource(struct connection_info *con_info,
   fprintf(stderr, "Loading resource %s in host %s\n", path, con_info->host);
 
   char *fullpath = get_abspath(con_info->host, con_info->is_localhost, path);
+  if (fullpath == NULL)
+    return NULL;
+
   enum FileType file_type = OTHER;
   bool found = false;
 
@@ -1081,6 +1132,21 @@ struct resource *load_resource(struct connection_info *con_info,
       } else {
         free(htmlpath);
       }
+    }
+  } else if (rc == 0 && S_ISLNK(fstat.st_mode)) {
+    // this is a symbolic link, return a permanent redirect to the link target
+    size_t bufsize = 2048;
+    char target[bufsize];
+    ssize_t chars = readlink(fullpath, target, bufsize);
+    if (chars == -1) {
+      fprintf(stderr, "Failed reading link target for %s: %s\n", fullpath,
+              strerror(errno));
+    } else {
+      target[chars] = '\0';
+      struct resource *res = empty_resource(path);
+      res->moved_to = slugify(con_info->L, target);
+      res->status = MHD_HTTP_PERMANENT_REDIRECT;
+      return res;
     }
   } else {
     if (access(fullpath, F_OK) == 0) {
@@ -1132,9 +1198,14 @@ struct resource *load_resource(struct connection_info *con_info,
   if (res->mime == NULL)
     res->mime = "text/plain";
 
+  FILE *fd;
+  bool file_opened = false;
+  bool file_closed = false;
+
   rc = lstat(fullpath, &fstat);
   if (rc) {
-    fprintf(stderr, "Failed running lstat on %s: %s\n", fullpath, strerror(errno));
+    fprintf(stderr, "Failed running lstat on %s: %s\n", fullpath,
+            strerror(errno));
     res->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
     goto cleanup;
   }
@@ -1143,10 +1214,6 @@ struct resource *load_resource(struct connection_info *con_info,
   res->size = fstat.st_size;
   res->ctime = fstat.st_ctime;
   res->mtime = fstat.st_mtime;
-
-  FILE *fd;
-  bool file_opened = false;
-  bool file_closed = false;
 
   fd = fopen(fullpath, "rb");
   if (fd == 0) {

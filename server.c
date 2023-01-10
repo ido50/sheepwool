@@ -45,7 +45,7 @@ struct server_info {
   magic_t magic_db;
 };
 
-static enum MHD_Result parse_header(void *cls, enum MHD_ValueKind kind,
+static int parse_header(void *cls, enum MHD_ValueKind kind,
                                     const char *key, const char *value) {
   struct connection_info *con_info = cls;
 
@@ -75,17 +75,17 @@ static enum MHD_Result parse_header(void *cls, enum MHD_ValueKind kind,
     }
   }
 
-  return MHD_YES;
+  return 1;
 }
 
-static enum MHD_Result push_header(void *cls, enum MHD_ValueKind kind,
+static int push_header(void *cls, enum MHD_ValueKind kind,
                                    const char *key, const char *value) {
   struct connection_info *con_info = cls;
   pushtableliteral(con_info->L, key, value);
-  return MHD_YES;
+  return 1;
 }
 
-static enum MHD_Result collect_param(void *cls, enum MHD_ValueKind kind,
+static int collect_param(void *cls, enum MHD_ValueKind kind,
                                      const char *key, const char *value) {
   lua_State *L = (lua_State *)cls;
   lua_pushstring(L, key);
@@ -116,7 +116,7 @@ static enum MHD_Result collect_param(void *cls, enum MHD_ValueKind kind,
     pushtableliteral(L, key, value);
   }
 
-  return MHD_YES;
+  return 1;
 }
 
 static void build_context(struct MHD_Connection *conn,
@@ -196,7 +196,7 @@ static int prepare_lua_resource(struct server_info *srv_info,
   // stack: [resource_lua, render, context]
 
   lua_newtable(con_info->L);
-  pushtableclosure(con_info->L, "list_resources", list_resources, 0);
+  pushtableclosure(con_info->L, "list_resources", list_resources, 1, con_info);
   pushtableclosure(con_info->L, "query_db", query_db, 1, con_info->db);
   pushtableclosure(con_info->L, "execute_cmd", execute_cmd, 0);
   pushtableclosure(con_info->L, "render_tmpl", render_tmpl, 1, con_info);
@@ -215,6 +215,8 @@ static int render_resource(struct server_info *srv_info,
   if (strcmp(con_info->resource->mime, "text/html") == 0) {
     lua_pushstring(con_info->L, con_info->resource->tmpl);
     lua_insert(con_info->L, 1);
+    if (con_info->status != 0)
+      pushtableint(con_info->L, "status", con_info->status);
     lua_pushlightuserdata(con_info->L, con_info);
     render_tmpl(con_info->L);
     size_t size = 0;
@@ -237,6 +239,9 @@ static int render_resource(struct server_info *srv_info,
       lua_settable(con_info->L, 4);
     }
 
+    if (con_info->status != 0)
+      pushtableint(con_info->L, "status", con_info->status);
+
     rc = lua_pcall(con_info->L, 2, 2, 0);
     if (rc != LUA_OK) {
       fprintf(stderr, "Failed rendering Lua resource: %s (code: %d)\n",
@@ -255,7 +260,7 @@ static int render_resource(struct server_info *srv_info,
   return 0;
 }
 
-static enum MHD_Result iterate_post(void *coninfo_cls, enum MHD_ValueKind kind,
+static int iterate_post(void *coninfo_cls, enum MHD_ValueKind kind,
                                     const char *key, const char *filename,
                                     const char *content_type,
                                     const char *transfer_encoding,
@@ -270,7 +275,7 @@ static enum MHD_Result iterate_post(void *coninfo_cls, enum MHD_ValueKind kind,
     lua_pop(L, 1);
   }
 
-  return MHD_YES;
+  return 1;
 }
 
 static void request_completed(void *cls, struct MHD_Connection *connection,
@@ -284,15 +289,17 @@ static void request_completed(void *cls, struct MHD_Connection *connection,
   if (con_info->postprocessor != NULL)
     MHD_destroy_post_processor(con_info->postprocessor);
 
-  lua_close(con_info->L);
-  free_resource(con_info->resource);
+  if (con_info->L != NULL)
+    lua_close(con_info->L);
+  if (con_info->resource != NULL)
+    free_resource(con_info->resource);
   if (con_info->db != NULL)
     sqlite_disconnect(con_info->db);
   free(con_info);
   *con_cls = NULL;
 }
 
-static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
+static int handle_req(void *cls, struct MHD_Connection *conn,
                                   const char *path, const char *method,
                                   const char *version, const char *upload_data,
                                   size_t *upload_data_size, void **con_cls) {
@@ -303,7 +310,7 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
 
     struct connection_info *con_info = malloc(sizeof(struct connection_info));
     if (con_info == NULL)
-      return MHD_NO;
+      return 0;
 
     con_info->magic_db = srv_info->magic_db;
     con_info->is_localhost = false;
@@ -334,11 +341,11 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
     char *dbpath =
         get_abspath(con_info->host, con_info->is_localhost, "/db.sqlite3");
     if (dbpath == NULL)
-      return MHD_NO;
+      return 0;
 
     int rc = sqlite_connect(&con_info->db, dbpath, false);
     if (rc)
-      return MHD_NO;
+      return 0;
 
     const union MHD_ConnectionInfo *ci =
         MHD_get_connection_info(conn, MHD_CONNECTION_INFO_CLIENT_ADDRESS);
@@ -368,14 +375,14 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
 
         if (con_info->postprocessor == NULL) {
           free(con_info);
-          return MHD_NO;
+          return 0;
         }
       }
     }
 
     *con_cls = (void *)con_info;
 
-    return MHD_YES;
+    return 1;
   }
 
   struct connection_info *con_info = *con_cls;
@@ -386,22 +393,22 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
       if (con_info->status != 0) {
         // we already know the answer, skip rest of upload
         *upload_data_size = 0;
-        return MHD_YES;
+        return 1;
       }
 
       if (MHD_post_process(con_info->postprocessor, upload_data,
-                           *upload_data_size) != MHD_YES) {
+                           *upload_data_size) != 1) {
         fprintf(stderr, "Failed post processing\n");
         con_info->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
       }
 
       *upload_data_size = 0;
 
-      return MHD_YES;
+      return 1;
     }
   }
 
-  if (con_info->status == 0) {
+  if (con_info->status == 0 && con_info->resource->moved_to == NULL) {
     int rc = render_resource(srv_info, conn, con_info);
     if (rc)
       con_info->status = 500;
@@ -423,7 +430,8 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
     }
   }
 
-  con_info->status =
+  if (con_info->status == 0)
+    con_info->status =
       con_info->resource->status ? con_info->resource->status : MHD_HTTP_OK;
 
   struct MHD_Response *response = MHD_create_response_from_buffer(
@@ -435,7 +443,7 @@ static enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn,
   if (con_info->resource->moved_to != NULL)
     MHD_add_response_header(response, "Location", con_info->resource->moved_to);
 
-  enum MHD_Result ret = MHD_queue_response(conn, con_info->status, response);
+  int ret = MHD_queue_response(conn, con_info->status, response);
 
   size_t max_date_size = strlen("18/Sep/2011:19:18:28 -0400") + 6;
   char *date = malloc(max_date_size);
@@ -467,6 +475,8 @@ static void sig_handler(int _) {
 int serve(unsigned int port) {
   signal(SIGINT, sig_handler);
 
+  int rc = 0;
+
   struct server_info *srv_info = malloc(sizeof(struct server_info));
   srv_info->magic_db = magic_open(MAGIC_MIME_TYPE);
   if (srv_info->magic_db == NULL) {
@@ -479,8 +489,6 @@ int serve(unsigned int port) {
             magic_error(srv_info->magic_db));
     goto cleanup;
   }
-
-  int rc = 0;
 
   struct MHD_Daemon *daemon = MHD_start_daemon(
       MHD_USE_AUTO | MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG, port,
