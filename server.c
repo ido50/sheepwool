@@ -45,8 +45,8 @@ struct server_info {
   magic_t magic_db;
 };
 
-static int parse_header(void *cls, enum MHD_ValueKind kind,
-                                    const char *key, const char *value) {
+static int parse_header(void *cls, enum MHD_ValueKind kind, const char *key,
+                        const char *value) {
   struct connection_info *con_info = cls;
 
   if (strcasecmp(key, "Host") == 0) {
@@ -78,15 +78,15 @@ static int parse_header(void *cls, enum MHD_ValueKind kind,
   return 1;
 }
 
-static int push_header(void *cls, enum MHD_ValueKind kind,
-                                   const char *key, const char *value) {
+static int push_header(void *cls, enum MHD_ValueKind kind, const char *key,
+                       const char *value) {
   struct connection_info *con_info = cls;
   pushtableliteral(con_info->L, key, value);
   return 1;
 }
 
-static int collect_param(void *cls, enum MHD_ValueKind kind,
-                                     const char *key, const char *value) {
+static int collect_param(void *cls, enum MHD_ValueKind kind, const char *key,
+                         const char *value) {
   lua_State *L = (lua_State *)cls;
   lua_pushstring(L, key);
   int ct = lua_gettable(L, -2);
@@ -100,16 +100,24 @@ static int collect_param(void *cls, enum MHD_ValueKind kind,
     lua_insert(L, -2);
     lua_settable(L, -3);
   } else if (ct == LUA_TSTRING) {
-    // turn to an array
-    const char *existing = lua_tostring(L, -1);
-    lua_pop(L, 1);
-    lua_pushstring(L, key);
-    lua_newtable(L);
-    lua_pushstring(L, existing);
-    lua_seti(L, -2, 1);
-    lua_pushstring(L, value);
-    lua_seti(L, -2, 2);
-    lua_settable(L, -3);
+    if (kind == MHD_POSTDATA_KIND) {
+      lua_pushstring(L, value);
+      lua_concat(L, 2);
+      lua_pushstring(L, key);
+      lua_insert(L, -2);
+      lua_settable(L, -3);
+    } else {
+      // turn to an array
+      const char *existing = lua_tostring(L, -1);
+      lua_pop(L, 1);
+      lua_pushstring(L, key);
+      lua_newtable(L);
+      lua_pushstring(L, existing);
+      lua_seti(L, -2, 1);
+      lua_pushstring(L, value);
+      lua_seti(L, -2, 2);
+      lua_settable(L, -3);
+    }
   } else {
     // push new value
     lua_pop(L, 1);
@@ -149,16 +157,8 @@ static void build_context(struct MHD_Connection *conn,
   pushtablestring(L, "srcpath", resource->srcpath);
   pushtableliteral(L, "name", resource->name);
   pushtablelstring(L, "content", resource->content, resource->size);
-  if (resource->ctime > 0) {
-    char *ctime = parse_time(resource->ctime);
-    pushtablestring(L, "ctime", ctime);
-    free(ctime);
-  }
-  if (resource->mtime > 0) {
-    char *mtime = parse_time(resource->mtime);
-    pushtablestring(L, "mtime", mtime);
-    free(mtime);
-  }
+  pushtablestring(L, "ctime", resource->ctime);
+  pushtablestring(L, "mtime", resource->mtime);
   pushtableint(L, "status", con_info->status);
 
   lua_pushliteral(L, "tags");
@@ -197,6 +197,8 @@ static int prepare_lua_resource(struct server_info *srv_info,
 
   lua_newtable(con_info->L);
   pushtableclosure(con_info->L, "list_resources", list_resources, 1, con_info);
+  pushtableclosure(con_info->L, "list_directories", list_directories, 1,
+                   con_info);
   pushtableclosure(con_info->L, "query_db", query_db, 1, con_info->db);
   pushtableclosure(con_info->L, "execute_cmd", execute_cmd, 0);
   pushtableclosure(con_info->L, "render_tmpl", render_tmpl, 1, con_info);
@@ -242,14 +244,15 @@ static int render_resource(struct server_info *srv_info,
     if (con_info->status != 0)
       pushtableint(con_info->L, "status", con_info->status);
 
-    rc = lua_pcall(con_info->L, 2, 2, 0);
+    rc = lua_pcall(con_info->L, 2, 3, 0);
     if (rc != LUA_OK) {
       fprintf(stderr, "Failed rendering Lua resource: %s (code: %d)\n",
               lua_tostring(con_info->L, -1), rc);
       return rc;
     }
-    // stack: [con_info->resource_lua, mime, content]
+    // stack: [con_info->resource_lua, status, mime, content]
 
+    con_info->resource->status = lua_tointeger(con_info->L, -3);
     con_info->resource->mime = lua_tostring(con_info->L, -2);
     size_t size = 0;
     const char *content = lua_tolstring(con_info->L, -1, &size);
@@ -261,11 +264,9 @@ static int render_resource(struct server_info *srv_info,
 }
 
 static int iterate_post(void *coninfo_cls, enum MHD_ValueKind kind,
-                                    const char *key, const char *filename,
-                                    const char *content_type,
-                                    const char *transfer_encoding,
-                                    const char *data, uint64_t off,
-                                    size_t size) {
+                        const char *key, const char *filename,
+                        const char *content_type, const char *transfer_encoding,
+                        const char *data, uint64_t off, size_t size) {
   if (kind == MHD_POSTDATA_KIND) {
     struct connection_info *con_info = coninfo_cls;
     lua_State *L = con_info->L;
@@ -299,10 +300,27 @@ static void request_completed(void *cls, struct MHD_Connection *connection,
   *con_cls = NULL;
 }
 
-static int handle_req(void *cls, struct MHD_Connection *conn,
-                                  const char *path, const char *method,
-                                  const char *version, const char *upload_data,
-                                  size_t *upload_data_size, void **con_cls) {
+static void set_lua_path(struct connection_info *con_info) {
+    char *path = get_abspath(con_info->host, con_info->is_localhost, "/?.lua");
+
+    // Get the current package.path and append the custom path
+    lua_getglobal(con_info->L, "package");
+    lua_getfield(con_info->L, -1, "path");
+    const char *current_path = lua_tostring(con_info->L, -1);
+    lua_pop(con_info->L, 1);
+
+    // Concatenate the custom path to the existing path
+    lua_pushfstring(con_info->L, "%s;%s", current_path, path);
+
+    // Set the modified package.path
+    lua_setfield(con_info->L, -2, "path");
+    lua_pop(con_info->L, 1);
+}
+
+static int handle_req(void *cls, struct MHD_Connection *conn, const char *path,
+                      const char *method, const char *version,
+                      const char *upload_data, size_t *upload_data_size,
+                      void **con_cls) {
   struct server_info *srv_info = cls;
 
   if (*con_cls == NULL) {
@@ -338,6 +356,8 @@ static int handle_req(void *cls, struct MHD_Connection *conn,
         str_starts_with(con_info->host, "127.0.0.1"))
       con_info->is_localhost = true;
 
+    set_lua_path(con_info);
+
     char *dbpath =
         get_abspath(con_info->host, con_info->is_localhost, "/db.sqlite3");
     if (dbpath == NULL)
@@ -371,7 +391,7 @@ static int handle_req(void *cls, struct MHD_Connection *conn,
 
       if (con_info->parse_body) {
         con_info->postprocessor = MHD_create_post_processor(
-            conn, 512, &iterate_post, (void *)con_info);
+            conn, 65536, &iterate_post, (void *)con_info);
 
         if (con_info->postprocessor == NULL) {
           free(con_info);
@@ -432,7 +452,7 @@ static int handle_req(void *cls, struct MHD_Connection *conn,
 
   if (con_info->status == 0)
     con_info->status =
-      con_info->resource->status ? con_info->resource->status : MHD_HTTP_OK;
+        con_info->resource->status ? con_info->resource->status : MHD_HTTP_OK;
 
   struct MHD_Response *response = MHD_create_response_from_buffer(
       con_info->resource->size, (void *)con_info->resource->content,
@@ -454,10 +474,13 @@ static int handle_req(void *cls, struct MHD_Connection *conn,
   } else {
     snprintf(date, max_date_size, "unknown");
   }
+
   fprintf(stdout, "%s %s - - [%s] \"%s %s %s\" %d %d \"%s\" \"%s\"\n",
-          con_info->host, con_info->remote, date, method, path, version,
-          con_info->status, con_info->resource->size, con_info->referer,
-          con_info->agent);
+          con_info->host ? con_info->host : "",
+          con_info->remote ? con_info->remote : "", date, method, path, version,
+          con_info->status, con_info->resource ? con_info->resource->size : 0,
+          con_info->referer ? con_info->referer : "",
+          con_info->agent ? con_info->agent : "");
   free(date);
 
   MHD_destroy_response(response);

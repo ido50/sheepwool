@@ -49,13 +49,6 @@
 #include "etlua.c"
 #include "library.h"
 
-enum FileType {
-  OTHER = 0,
-  LUA = 1,
-  HTML = 2,
-  SCSS = 3,
-};
-
 static char *get_basename(char *path) {
   char *dup_path = strdup(path);
   char *base_name = strdup(basename(dup_path));
@@ -134,9 +127,9 @@ static char *slugify(lua_State *L, char *orig) {
 }
 
 char *parse_time(time_t time) {
-  size_t size = sizeof("2022-01-01T00:00:00");
+  size_t size = sizeof("2022-01-01");
   char *target = malloc(size);
-  strftime(target, size, "%Y-%m-%dT%H:%M:%S", gmtime(&time));
+  strftime(target, size, "%Y-%m-%d", gmtime(&time));
   return target;
 }
 
@@ -486,6 +479,57 @@ int list_resources(lua_State *L) {
   // stack is now: [dirpath, ext, results, libstring]
   lua_pop(L, 1);
   lua_remove(L, 2);
+  // stack is now: [results]
+
+cleanup:
+  if (dir)
+    closedir(dir);
+  free(fullpath);
+  if (rc)
+    return lua_error(L);
+
+  return 1;
+}
+
+int list_directories(lua_State *L) {
+  struct connection_info *con_info =
+      (struct connection_info *)lua_touserdata(L, lua_upvalueindex(1));
+
+  // stack: [dirpath]
+  const char *dirpath = lua_tostring(L, 1);
+
+  char *fullpath = get_abspath(con_info->host, con_info->is_localhost, dirpath);
+  if (fullpath == NULL)
+    return luaL_error(L, "Failed getting real path from %s", dirpath);
+
+  int rc = 0;
+
+  DIR *dir = opendir(fullpath);
+  if (dir == NULL) {
+    rc = 1;
+    lua_pushfstring(L, "Failed opening directory %s: %s", fullpath,
+                    strerror(errno));
+    goto cleanup;
+  }
+
+  // create a table that will hold the results
+  lua_newtable(L);
+
+  // stack: [dirpath, results]
+
+  struct dirent *entry;
+  int i = 0;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_name[0] == '.' || entry->d_type != DT_DIR)
+      continue;
+
+    lua_pushstring(L, entry->d_name);
+    // stack: [dirpath, results, subdir]
+    lua_seti(L, 2, ++i);
+    // stack: [dirpath, results]
+  }
+
+  lua_remove(L, 1);
   // stack is now: [results]
 
 cleanup:
@@ -1015,13 +1059,9 @@ static int parse_html(lua_State *L, struct resource *res, char *abspath) {
       }
       res->tags[i] = NULL;
     } else if (strcmp(key, "ctime") == 0) {
-      struct tm ctime;
-      if (strptime(value, "%Y-%m-%dT%T", &ctime) != NULL)
-        res->ctime = mktime(&ctime);
+      res->ctime = strdup(value);
     } else if (strcmp(key, "mtime") == 0) {
-      struct tm mtime;
-      if (strptime(value, "%Y-%m-%dT%T", &mtime) != NULL)
-        res->mtime = mktime(&mtime);
+      res->mtime = strdup(value);
     }
 
     lua_pop(L, 2);
@@ -1072,6 +1112,7 @@ struct resource *empty_resource(const char *path) {
   res->baseurl = NULL;
   res->slug = path;
   res->srcpath = NULL;
+  res->type = OTHER;
   res->mime = NULL;
   res->name = NULL;
   res->status = MHD_HTTP_OK;
@@ -1079,8 +1120,8 @@ struct resource *empty_resource(const char *path) {
   res->size = 0;
   res->tmpl = NULL;
   res->moved_to = NULL;
-  res->ctime = 0;
-  res->mtime = 0;
+  res->ctime = NULL;
+  res->mtime = NULL;
   res->tags = NULL;
   return res;
 }
@@ -1088,6 +1129,7 @@ struct resource *empty_resource(const char *path) {
 struct resource *error_resource(const char *path, int status) {
   struct resource *res = empty_resource(path);
   res->status = status;
+  res->type = OTHER;
   res->mime = "text/plain";
   const char *prefix = "Error ";
   size_t prefix_len = strlen(prefix);
@@ -1099,10 +1141,48 @@ struct resource *error_resource(const char *path, int status) {
   return res;
 }
 
-struct resource *load_resource(struct connection_info *con_info,
-                               const char *path) {
-  fprintf(stderr, "Loading resource %s in host %s\n", path, con_info->host);
+static char *find_catchall(struct connection_info *con_info, char *fullpath,
+                           bool is_dir) {
+  char *parent = fullpath;
 
+  if (!is_dir) {
+    parent = dirname(fullpath);
+    if (parent == NULL) {
+      fprintf(stderr, "Failed getting parent of %s: %s\n", fullpath,
+              strerror(errno));
+      free(fullpath);
+      return NULL;
+    }
+  }
+
+  while (strcmp(parent, ".") >= 0) {
+    char *luapath = dup_and_push(parent, "/catchall.lua");
+    if (access(luapath, F_OK) == 0) {
+      free(parent);
+      return luapath;
+    }
+
+    if (strcmp(parent, ".") == 0) {
+      free(parent);
+      break;
+    }
+
+    char *new_parent = dirname(parent);
+    if (new_parent == NULL) {
+      fprintf(stderr, "Failed getting parent of %s: %s\n", parent,
+              strerror(errno));
+      free(parent);
+      break;
+    }
+
+    parent = new_parent;
+  }
+
+  return NULL;
+}
+
+static struct resource *locate_resource(struct connection_info *con_info,
+                                        const char *path) {
   char *fullpath = get_abspath(con_info->host, con_info->is_localhost, path);
   if (fullpath == NULL)
     return NULL;
@@ -1131,6 +1211,12 @@ struct resource *load_resource(struct connection_info *con_info,
         fullpath = htmlpath;
       } else {
         free(htmlpath);
+        /*char *catchall = find_catchall(con_info, fullpath, true);
+        if (catchall != NULL) {
+          file_type = LUA;
+          found = true;
+          fullpath = catchall;
+        }*/
       }
     }
   } else if (rc == 0 && S_ISLNK(fstat.st_mode)) {
@@ -1160,21 +1246,26 @@ struct resource *load_resource(struct connection_info *con_info,
         fullpath = scss_path;
       }
     } else {
-      if (access(fullpath, F_OK) != 0) {
-        char *luapath = dup_and_push(fullpath, ".lua");
-        if (access(luapath, F_OK) == 0) {
-          file_type = LUA;
+      char *luapath = dup_and_push(fullpath, ".lua");
+      if (access(luapath, F_OK) == 0) {
+        file_type = LUA;
+        found = true;
+        free(fullpath);
+        fullpath = luapath;
+      } else {
+        char *htmlpath = dup_and_push(fullpath, ".html");
+        if (access(htmlpath, F_OK) == 0) {
+          file_type = HTML;
           found = true;
           free(fullpath);
-          fullpath = luapath;
+          fullpath = htmlpath;
         } else {
-          char *htmlpath = dup_and_push(fullpath, ".html");
-          if (access(htmlpath, F_OK) == 0) {
-            file_type = HTML;
+          /*char *catchall = find_catchall(con_info, fullpath, false);
+          if (catchall != NULL) {
+            file_type = LUA;
             found = true;
-            free(fullpath);
-            fullpath = htmlpath;
-          }
+            fullpath = catchall;
+          }*/
         }
       }
     }
@@ -1188,8 +1279,8 @@ struct resource *load_resource(struct connection_info *con_info,
   fprintf(stderr, "Found resource %s in file %s\n", path, fullpath);
 
   struct resource *res = empty_resource(path);
-
   res->srcpath = fullpath;
+  res->type = file_type;
   res->mime = file_type == LUA    ? "text/x-lua"
               : file_type == SCSS ? "text/css"
               : file_type == HTML ? "text/html"
@@ -1198,26 +1289,47 @@ struct resource *load_resource(struct connection_info *con_info,
   if (res->mime == NULL)
     res->mime = "text/plain";
 
+  return res;
+}
+
+struct resource *load_resource(struct connection_info *con_info,
+                               const char *path) {
+  if (con_info->host == NULL) {
+    fprintf(stderr, "Got a request for %s with no host\n", path);
+    return NULL;
+  }
+
+  fprintf(stderr, "Loading resource %s in host %s\n", path, con_info->host);
+
+  struct resource *res = locate_resource(con_info, path);
+  if (res == NULL || res->moved_to != NULL)
+    return res;
+
+  fprintf(stderr, "Resource %s is located at %s and it's a %s resource\n", path,
+          res->srcpath, res->mime);
+
   FILE *fd;
   bool file_opened = false;
   bool file_closed = false;
 
-  rc = lstat(fullpath, &fstat);
+  struct stat fstat;
+  int rc = lstat(res->srcpath, &fstat);
   if (rc) {
-    fprintf(stderr, "Failed running lstat on %s: %s\n", fullpath,
+    fprintf(stderr, "Failed running lstat on %s: %s\n", res->srcpath,
             strerror(errno));
     res->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
     goto cleanup;
   }
 
-  res->name = get_basename(fullpath);
+  res->name = get_basename(res->srcpath);
   res->size = fstat.st_size;
-  res->ctime = fstat.st_ctime;
-  res->mtime = fstat.st_mtime;
+  res->ctime = parse_time(fstat.st_ctime);
+  res->mtime = parse_time(fstat.st_mtime);
 
-  fd = fopen(fullpath, "rb");
+  fd = fopen(res->srcpath, "rb");
   if (fd == 0) {
-    fprintf(stderr, "Failed opening file %s: %s\n", fullpath, strerror(errno));
+    fprintf(stderr, "Failed opening file %s: %s\n", res->srcpath,
+            strerror(errno));
     res->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
     goto cleanup;
   }
@@ -1226,14 +1338,15 @@ struct resource *load_resource(struct connection_info *con_info,
 
   res->content = malloc(res->size + 1);
   if (res->content == 0) {
-    fprintf(stderr, "Failed allocating memory for file %s: %s\n", fullpath,
+    fprintf(stderr, "Failed allocating memory for file %s: %s\n", res->srcpath,
             strerror(errno));
     res->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
     goto cleanup;
   }
 
   if (res->size > 0 && fread(res->content, res->size, 1, fd) != 1) {
-    fprintf(stderr, "Failed reading file %s: %s\n", fullpath, strerror(errno));
+    fprintf(stderr, "Failed reading file %s: %s\n", res->srcpath,
+            strerror(errno));
     res->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
     goto cleanup;
   }
@@ -1243,19 +1356,17 @@ struct resource *load_resource(struct connection_info *con_info,
   fclose(fd);
   file_closed = true;
 
-  if (file_type == LUA) {
-    res->mime = "text/x-lua";
-  } else if (file_type == HTML) {
-    int rc = parse_html(con_info->L, res, fullpath);
+  if (res->type == HTML) {
+    int rc = parse_html(con_info->L, res, res->srcpath);
     if (rc) {
-      fprintf(stderr, "Failed parsing HTML file %s: %d\n", fullpath, rc);
+      fprintf(stderr, "Failed parsing HTML file %s: %d\n", res->srcpath, rc);
       res->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
       goto cleanup;
     }
-  } else if (file_type == SCSS) {
+  } else if (res->type == SCSS) {
     int rc = parse_scss(res);
     if (rc) {
-      fprintf(stderr, "Failed parsing SCSS file %s: %d\n", fullpath, rc);
+      fprintf(stderr, "Failed parsing SCSS file %s: %d\n", res->srcpath, rc);
       res->status = MHD_HTTP_INTERNAL_SERVER_ERROR;
       goto cleanup;
     }
