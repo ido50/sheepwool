@@ -29,6 +29,13 @@ enum ContentType {
   CT_JSON = 3
 };
 
+enum FileType {
+  OTHER = 0,
+  LUA = 1,
+  HTML = 2,
+  SCSS = 3,
+};
+
 struct connection_info {
   magic_t magic_db;
   sqlite3 *db;
@@ -52,6 +59,7 @@ struct resource {
   char *baseurl;
   const char *slug;
   char *srcpath;
+  enum FileType type;
   const char *mime;
   char *name;
   int status;
@@ -59,8 +67,8 @@ struct resource {
   int size;
   char *tmpl;
   char *moved_to;
-  time_t ctime;
-  time_t mtime;
+  char *ctime;
+  char *mtime;
   char **tags;
 };
 
@@ -82,6 +90,7 @@ struct resource *load_resource(struct connection_info *con_info,
                                const char *path);
 void free_resource(struct resource *load_resource);
 int list_resources(lua_State *L);
+int list_directories(lua_State *L);
 int render_tmpl(lua_State *L);
 int base64enc(lua_State *L);
 int base64dec(lua_State *L);
