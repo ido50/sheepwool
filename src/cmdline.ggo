@@ -1,0 +1,7 @@
+versiontext "Copyright, 2024, Ido Perlmuter"
+
+args "--default-optional --unnamed-opts=DIR --show-required"
+
+option "port" p "Port to listen on"
+  int typestr="portnumber"
+  default="8080"
