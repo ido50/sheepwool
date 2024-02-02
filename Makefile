@@ -215,8 +215,8 @@ AUTOMAKE = ${SHELL} '/home/ido/Code/foss/sheepwool/vendor/missing' automake-1.16
 AWK = gawk
 CC = gcc
 CCDEPMODE = depmode=gcc3
-CFLAGS =  -g -O0  -D_REENTRANT -D_GNU_SOURCE -fwrapv -fno-strict-aliasing -pipe -fstack-protector-strong -I/usr/local/include -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64  -I/usr/lib/perl5/5.38/core_perl/CORE 
-CPPFLAGS = 
+CFLAGS =  -g -O0  -D_REENTRANT -D_GNU_SOURCE -fwrapv -fno-strict-aliasing -pipe -fstack-protector-strong -I/usr/include/db5.3 -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64  -I/usr/lib/perl5/5.38/core_perl/CORE 
+CPPFLAGS =  -I/usr/include -I/usr/include
 CSCOPE = cscope
 CTAGS = ctags
 CYGPATH_W = echo
@@ -240,13 +240,21 @@ INSTALL_PROGRAM = ${INSTALL}
 INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
 LD = /usr/bin/ld -m elf_x86_64
-LDFLAGS =  -Wl,-E -Wl,-rpath,/usr/lib/perl5/5.38/core_perl/CORE -Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now -flto=auto -fstack-protector-strong -L/usr/local/lib  -L/usr/lib/perl5/5.38/core_perl/CORE -lperl -lpthread -ldl -lm -lcrypt -lutil -lc
+LDFLAGS =  -Wl,-E -Wl,-rpath,/usr/lib/perl5/5.38/core_perl/CORE -Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now -Wl,-z,pack-relative-relocs -flto=auto -fstack-protector-strong -L/usr/lib/db5.3  -L/usr/lib/perl5/5.38/core_perl/CORE -lperl -lpthread -ldl -lm -lcrypt -lutil -lc -L/usr/lib -L/usr/lib
+LIBBROTLIENC_CFLAGS = 
+LIBBROTLIENC_LIBS = -lbrotlienc
+LIBCONFIG_CFLAGS = 
+LIBCONFIG_LIBS = -lconfig
+LIBCURL_CFLAGS = 
+LIBCURL_LIBS = -lcurl
 LIBMAGIC_CFLAGS = 
 LIBMAGIC_LIBS = -lmagic
 LIBMICROHTTPD_CFLAGS = -I/usr/include/p11-kit-1
 LIBMICROHTTPD_LIBS = -lmicrohttpd
 LIBOBJS = 
-LIBS = 
+LIBPCRE_CFLAGS = 
+LIBPCRE_LIBS = -lpcre
+LIBS = -lz 
 LIBTOOL = $(SHELL) $(top_builddir)/libtool
 LIPO = 
 LN_S = ln -s
@@ -270,8 +278,8 @@ PACKAGE_URL = https://github.com/ido50/sheepwool
 PACKAGE_VERSION = 6.0.0
 PATH_SEPARATOR = :
 PERL = perl
-PERLXS_CFLAGS =  -D_REENTRANT -D_GNU_SOURCE -fwrapv -fno-strict-aliasing -pipe -fstack-protector-strong -I/usr/local/include -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64  -I/usr/lib/perl5/5.38/core_perl/CORE 
-PERLXS_LDFLAGS = -Wl,-E -Wl,-rpath,/usr/lib/perl5/5.38/core_perl/CORE -Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now -flto=auto -fstack-protector-strong -L/usr/local/lib  -L/usr/lib/perl5/5.38/core_perl/CORE -lperl -lpthread -ldl -lm -lcrypt -lutil -lc
+PERLXS_CFLAGS =  -D_REENTRANT -D_GNU_SOURCE -fwrapv -fno-strict-aliasing -pipe -fstack-protector-strong -I/usr/include/db5.3 -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64  -I/usr/lib/perl5/5.38/core_perl/CORE 
+PERLXS_LDFLAGS = -Wl,-E -Wl,-rpath,/usr/lib/perl5/5.38/core_perl/CORE -Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now -Wl,-z,pack-relative-relocs -flto=auto -fstack-protector-strong -L/usr/lib/db5.3  -L/usr/lib/perl5/5.38/core_perl/CORE -lperl -lpthread -ldl -lm -lcrypt -lutil -lc
 PKG_CONFIG = /usr/bin/pkg-config
 PKG_CONFIG_LIBDIR = 
 PKG_CONFIG_PATH = 

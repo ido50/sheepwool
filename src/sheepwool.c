@@ -1,6 +1,6 @@
 /*	$Id$ */
 /*
- * Copyright (c) 2022 Ido Perlmuter <sheepwool@ido50.net>
+ * Copyright (c) 2024 Ido Perlmuter <sheepwool@ido50.net>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -22,74 +22,39 @@
 #define _ISOC99_SOURCE
 #include "config.h"
 
-#include <arpa/inet.h> // for inet_ntoa
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <curl/curl.h>
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
-#include <libgen.h>  //for basename
+#include <libconfig.h>
+#include <libgen.h>
 #include <magic.h>
 #include <microhttpd.h>
-#include <netinet/in.h> // for sockaddr_in
-#include <regex.h>
+#include <netinet/in.h>
 #include <signal.h>
-#include <stdbool.h>    // for false, bool, true
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>    // for strcasecmp
-#include <sys/socket.h> // for AF_INET, sockaddr
+#include <strings.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <time.h>       // for strftime, localtime, time
+#include <time.h>
 #include <unistd.h>
-#include <EXTERN.h>
-#include <perl.h>
+#include <utarray.h>
+#include <uthash.h>
+#include <zlib.h>
 
 #include "cmdline.h"
-#include "hash.h"
-#include "list.h"
-#include "str-utils.h"
-
-#ifdef DEBUG
-#define DEBUG_PRINT(fmt, args ...)    fprintf(stderr, fmt, ## args)
-#else
-#define DEBUG_PRINT(fmt, args ...)    /* Don't do anything in release builds */
-#endif
+#include "sheepwool.h"
 
 extern int pledge(const char *promises, const char *execpromises);
 extern int unveil(const char *path, const char *permissions);
 
 static size_t max_date_size = strlen("18/Sep/2011:19:18:28 -0400") + 6;
-
-struct server_info {
-	magic_t magic_db;
-};
-
-enum param_type {
-	STRING = 1,
-	ARRAY = 2
-};
-
-struct body_param {
-	enum param_type type;
-	const char *string_value;
-	list_t *list_value;
-};
-
-struct resource {
-	char *fullpath;
-	off_t size;
-};
-
-struct request {
-	bool is_localhost;
-	struct MHD_PostProcessor *postprocessor;
-	hash_t *headers;
-	hash_t *body_params;
-	char *remote;
-	int status;
-	struct resource *res;
-};
 
 void request_completed(void *cls, struct MHD_Connection *connection,
                        void **con_cls, enum MHD_RequestTerminationCode toe) {
@@ -98,164 +63,109 @@ void request_completed(void *cls, struct MHD_Connection *connection,
 
 	struct request *req = *con_cls;
 
-	if (req->remote != NULL) {
+	if (req->dec_path != NULL)
+		curl_free(req->dec_path);
+
+	if (req->url != NULL)
+		curl_url_cleanup(req->url);
+
+	if (req->remote != NULL)
 		free(req->remote);
+
+	if (req->headers != NULL) {
+		struct param *current_header, *tmp;
+
+		HASH_ITER(hh, req->headers, current_header, tmp) {
+			HASH_DEL(req->headers, current_header);
+			free(current_header);
+		}
 	}
-
-	if (req->headers != NULL)
-		hash_free(req->headers);
-
-	if (req->res == NULL)
-		return;
 
 	if (req->postprocessor != NULL)
 		MHD_destroy_post_processor(req->postprocessor);
 
-	if (req->body_params != NULL)
-		hash_free(req->body_params);
+	if (req->body_params != NULL) {
+		struct body_param *current_param, *tmp;
 
-	free(req->res->fullpath);
-	free(req->res);
+		HASH_ITER(hh, req->body_params, current_param, tmp) {
+			HASH_DEL(req->body_params, current_param);
+			if (current_param->type == ARRAY)
+				utarray_free(current_param->array_value);
+			free(current_param);
+		}
+	}
+
+	if (req->res != NULL) {
+		free(req->res->fullpath);
+		free(req->res);
+	}
+
+	if (req->resp != NULL) {
+		if (req->resp->backend != NULL)
+			MHD_destroy_response(req->resp->backend);
+		if (req->resp->content_type != NULL)
+			free(req->resp->content_type);
+		if (req->resp->content != NULL)
+			free(req->resp->content);
+		free(req->resp);
+	}
+
 	free(req);
 
 	*con_cls = NULL;
 }
 
-/*static int parse_html(struct resource *res, char *abspath) {*/
-/*char *line = NULL;*/
-/*size_t len = 0;*/
-/*ssize_t read;*/
-/*regex_t regex;*/
-/*regmatch_t matches[3];*/
-/*long mismatch_position = -1;*/
+bool has_suffix(const char *string, const char *suffix) {
+	if (string == NULL || suffix == NULL) return false;
 
-/*// Compile the regular expression*/
-/*if (regcomp(&regex, "<!--\\s*KEY:\\s*(.+)\\s*VALUE:\\s*(.+)\\s*-->", REG_EXTENDED)) {*/
-/*fprintf(stderr, "Could not compile regex\n");*/
-/*return 1;*/
-/*}*/
+	size_t string_len = strlen(string);
+	size_t suffix_len = strlen(suffix);
 
-/*res->mime = "text/html";*/
+	if (suffix_len > string_len) return false;
 
-/*while ((read = getline(&line, &len, res->fh)) != -1) {*/
-/*if (!regexec(&regex, line, 3, matches, 0)) {*/
-/*char key[matches[1].rm_eo - matches[1].rm_so + 1];*/
-/*char value[matches[2].rm_eo - matches[2].rm_so + 1];*/
-
-/*strncpy(key, line + matches[1].rm_so, matches[1].rm_eo - matches[1].rm_so);*/
-/*key[matches[1].rm_eo - matches[1].rm_so] = '\0';*/
-
-/*strncpy(value, line + matches[2].rm_so, matches[2].rm_eo - matches[2].rm_so);*/
-/*value[matches[2].rm_eo - matches[2].rm_so] = '\0';*/
-
-/*printf("Found KEY: %s, VALUE: %s\n", key, value);*/
-
-/*if (strcmp(key, "name") == 0) {*/
-/*if (res->name != NULL)*/
-/*free(res->name);*/
-/*res->name = strdup(value);*/
-/*} else if (strcmp(key, "template") == 0) {*/
-/*res->tmpl = strdup(value);*/
-/*} else if (strcmp(key, "status") == 0) {*/
-/*if (strcmp(value, "gone") == 0) {*/
-/*res->status = MHD_HTTP_GONE;*/
-/*} else if (strcmp(value, "moved") == 0) {*/
-/*res->status = MHD_HTTP_MOVED_PERMANENTLY;*/
-/*} else {*/
-/*res->status = MHD_HTTP_OK;*/
-/*}*/
-/*} else if (strcmp(key, "tags") == 0) {*/
-/*char *tags = strdup(value);*/
-/*int i = 0;*/
-/*char *tag = strtok(tags, ", ");*/
-/*while (tag) {*/
-/*// we are allocating enough memory for one tag (or the number of tags*/
-/*// we have) plus one NULL pointer (sentinel)*/
-/*if (i > 0)*/
-/*res->tags = realloc(res->tags, sizeof(char *) * (i + 2));*/
-/*else*/
-/*res->tags = malloc(sizeof(char *) * 2);*/
-/*res->tags[i] = tag;*/
-/*tag = strtok(NULL, ", ");*/
-/*i++;*/
-/*}*/
-/*res->tags[i] = NULL;*/
-/*} else if (strcmp(key, "ctime") == 0) {*/
-/*res->ctime = strdup(value);*/
-/*} else if (strcmp(key, "mtime") == 0) {*/
-/*res->mtime = strdup(value);*/
-/*}*/
-/*} else {*/
-/*mismatch_position = ftell(res->fh);*/
-/*break;*/
-/*}*/
-/*}*/
-
-/*free(line);*/
-/*regfree(&regex);*/
-
-/*if (mismatch_position != -1) {*/
-/*// Allocate memory for the remainder of the file*/
-/*long remainder_size = res->size - mismatch_position;*/
-/*res->size -= mismatch_position;*/
-/*res->content = malloc(remainder_size + 1);*/
-/*fread(res->content, 1, remainder_size, res->fh);*/
-/*res->content[remainder_size] = '\0';*/
-/*}*/
-
-/*return 0;*/
-/*}*/
-
-static enum MHD_Result serve_resource(struct server_info *srv_info,
-                                      struct MHD_Connection *conn,
-                                      struct request *req) {
-	int fd = open(req->res->fullpath, O_RDONLY);
-	if (fd == -1) {
-		fprintf(stderr, "Failed opening file %s: %s\n", req->res->fullpath, strerror(errno));
-		return MHD_NO;
-	}
-
-	struct MHD_Response *response = MHD_create_response_from_fd(req->res->size, fd);
-
-	const char *content_type = magic_file(srv_info->magic_db, req->res->fullpath);
-	if (content_type == NULL)
-		content_type = "text/plain";
-
-	MHD_add_response_header(response, "Content-Type", content_type);
-
-	enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, response);
-
-	MHD_destroy_response(response);
-
-	return ret;
+	// Compare the end of the string with the suffix
+	return strncmp(string + string_len - suffix_len, suffix, suffix_len) == 0;
 }
 
 static enum MHD_Result collect_param(void *coninfo_cls, enum MHD_ValueKind kind,
                                      const char *key, const char *value) {
 	struct request *req = coninfo_cls;
 
-	struct body_param *param = hash_get(req->body_params, key);
+	struct body_param *param = NULL;
+	HASH_FIND_STR(req->body_params, key, param);
 
 	if (param == NULL) {
 		// new string parameter
-		struct body_param param = {
-			.string_value = value,
-			.type = STRING,
-		};
-		hash_set(req->body_params, key, &param);
+		param = malloc(sizeof *param);
+		param->name = key;
+		param->string_value = value;
+		param->type = STRING;
+		HASH_ADD_STR(req->body_params, name, param);
 		return MHD_YES;
 	}
 
 	if (param->type == ARRAY) {
 		// Push to an existing array
-		list_rpush(param->list_value, list_node_new((void*)value));
+		utarray_push_back(param->array_value, value);
 	} else {
 		// Turn existing string into an array and push new value
 		param->type = ARRAY;
-		param->list_value = list_new();
-		list_rpush(param->list_value, list_node_new((void*)param->string_value));
-		list_rpush(param->list_value, list_node_new((void*)value));
+		utarray_new(param->array_value, &ut_str_icd);
+		utarray_push_back(param->array_value, param->string_value);
+		utarray_push_back(param->array_value, value);
 	}
+
+	return MHD_YES;
+}
+
+static enum MHD_Result build_qs(void *coninfo_cls, enum MHD_ValueKind kind,
+                                const char *key, const char *value) {
+	struct request *req = coninfo_cls;
+
+	size_t part_len = strlen(key)+1+strlen(value)+1;
+	char part[part_len];
+	snprintf(part, part_len, "%s=%s", key, value);
+	curl_url_set(req->url, CURLUPART_QUERY, part, CURLU_APPENDQUERY);
 
 	return MHD_YES;
 }
@@ -272,37 +182,26 @@ static enum MHD_Result iterate_post(void *coninfo_cls, enum MHD_ValueKind kind,
 
 static enum MHD_Result parse_header(void *cls, enum MHD_ValueKind kind, const char *key,
                                     const char *value) {
-	hash_t *headers = cls;
-	hash_set(headers, case_lower((char*)key), (void*)value);
-	return MHD_YES;
-}
+	struct request *req = cls;
+	int len = strlen(key);
 
-static enum MHD_Result parse_request(struct MHD_Connection *conn,
-                                     const char *path, const char *method,
-                                     const char *upload_data,
-                                     size_t *upload_data_size,
-                                     struct request *req) {
-	if (method[0] == 'P') {
-		const char *content_type = hash_get(req->headers, "content-type");
-		if (content_type != NULL && (
-			    str_starts_with(content_type, "application/x-www-form-urlencoded") ||
-			    str_starts_with(content_type, "multipart/form-data")
-			    )) {
-			req->postprocessor = MHD_create_post_processor(
-				conn, 65536, &iterate_post, (void *)&req);
+	char *header_name = malloc(len+1);
+	for (int i = 0; i <= len-1; i++)
+		header_name[i] = tolower(key[i]);
+	header_name[len] = '\0';
 
-			if (req->postprocessor == NULL) {
-				DEBUG_PRINT("POST processor is NULL\n");
-				return MHD_NO;
-			}
-		}
-	}
+	struct param *header = malloc(sizeof *header);
+	header->name = header_name;
+	header->value = value;
+
+	HASH_ADD_STR(req->headers, name, header);
 
 	return MHD_YES;
 }
 
-static struct resource *locate_resource(struct request *req, char *fullpath, bool exact) {
+static struct resource *locate_resource_in_fs(struct request *req, char *fullpath, bool exact) {
 	DEBUG_PRINT("Looking for %s, exact=%d\n", fullpath, exact);
+
 	struct stat fstat;
 	int rc = lstat(fullpath, &fstat);
 	int err = errno;
@@ -318,27 +217,40 @@ static struct resource *locate_resource(struct request *req, char *fullpath, boo
 		}
 
 		// Try with .html
-		fullpath = realloc(fullpath, strlen(fullpath) + 4);
+		fullpath = realloc(fullpath, strlen(fullpath) + 4 + 1);
 		if (fullpath == NULL) {
 			fprintf(stderr, "Failed reallocing fullpath: %s\n", strerror(errno));
 			abort();
 		}
 		strcat(fullpath, ".html");
-		return locate_resource(req, fullpath, true);
+		return locate_resource_in_fs(req, fullpath, true);
 	}
 
 	if (S_ISDIR(fstat.st_mode)) {
 		// This is a directory, look for an index.html file in it
-		fullpath = realloc(fullpath, strlen(fullpath) + 11);
+		int newlen = strlen(fullpath) + (fullpath[strlen(fullpath)-1] == '/' ? 10 : 11) + 1;
+		fullpath = realloc(fullpath, newlen);
 		if (fullpath == NULL) {
 			fprintf(stderr, "Failed reallocing fullpath: %s\n", strerror(errno));
 			return NULL;
 		}
-		if (str_ends_with(fullpath, "/"))
+
+		if (fullpath[strlen(fullpath)-1] == '/')
 			strcat(fullpath, "index.html");
 		else
 			strcat(fullpath, "/index.html");
-		return locate_resource(req, fullpath, true);
+
+		struct resource *index_html = locate_resource_in_fs(req, fullpath, true);
+		if (index_html != NULL)
+			return index_html;
+
+		// Try index.psgi
+		fullpath[newlen - 5] = 'p';
+		fullpath[newlen - 4] = 's';
+		fullpath[newlen - 3] = 'g';
+		fullpath[newlen - 2] = 'i';
+
+		return locate_resource_in_fs(req, fullpath, true);
 	}
 
 	// If this is a regular file, we can serve it directly, just make sure we have
@@ -350,8 +262,15 @@ static struct resource *locate_resource(struct request *req, char *fullpath, boo
 			fprintf(stderr, "Failed allocating for resource: %s\n", strerror(errno));
 			return NULL;
 		}
+
 		res->fullpath = fullpath;
+		res->type = has_suffix(fullpath, ".psgi")
+      ? PSGI
+      : has_suffix(fullpath, ".html")
+      ? HTML
+      : STAT;
 		res->size = fstat.st_size;
+		res->mtime = fstat.st_mtim;
 		return res;
 	}
 
@@ -371,7 +290,7 @@ static char *get_fullpath(struct request *req, const char *path) {
 
 	char *fullpath = NULL;
 
-	if (req->is_localhost) {
+	if (true) {
 		// remove heading slash
 		if (path[0] == '/') {
 			len -= 1;
@@ -388,8 +307,7 @@ static char *get_fullpath(struct request *req, const char *path) {
 	}
 
 	// account for the host
-	const char *host = hash_get(req->headers, "host");
-	len += strlen(host);
+	len += strlen(req->host);
 
 	// we need a heading slash when we have a host
 	if (path[0] != '/')
@@ -400,7 +318,7 @@ static char *get_fullpath(struct request *req, const char *path) {
 		return NULL;
 
 	char *p = stpcpy(fullpath, "./");
-	p = stpcpy(p, host);
+	p = stpcpy(p, req->host);
 	if (path[0] != '/')
 		p = stpcpy(p, "/");
 	stpcpy(p, path);
@@ -424,50 +342,108 @@ static void write_access_log(const char *method, const char *path,
 	if (remote == NULL)
 		remote = "-";
 
-	const char *referer = hash_get(req->headers, "referer");
-	if (referer == NULL)
-		referer = "";
+	struct param *refererp = NULL;
+	HASH_FIND_STR(req->headers, "referer", refererp);
+	const char *referer = refererp ? refererp->value : "";
 
-	const char *user_agent = hash_get(req->headers, "user-agent");
-	if (user_agent == NULL)
-		user_agent = "";
+	struct param *agentp = NULL;
+	HASH_FIND_STR(req->headers, "user-agent", agentp);
+	const char *user_agent = agentp ? agentp->value : "";
 
 	fprintf(stdout, "%s %s - - [%s] \"%s %s %s\" %d %ld \"%s\" \"%s\"\n",
-	        (const char*)hash_get(req->headers, "host"),
+	        req->host,
 	        remote,
 	        date,
 	        method,
 	        path,
 	        version,
-	        ret == MHD_YES ? MHD_HTTP_OK : MHD_HTTP_INTERNAL_SERVER_ERROR,
-	        req->res->size,
+	        req->resp->status,
+	        req->resp->size,
 	        referer,
 	        user_agent);
 }
 
-static enum MHD_Result init_request(void *cls, struct MHD_Connection *conn, const char *path,
+static bool request_is_safe(const char *method) {
+	return strcmp(method, "GET") == 0 ||
+	       strcmp(method, "HEAD") == 0 ||
+	       strcmp(method, "OPTIONS") == 0;
+}
+
+static enum MHD_Result init_request(void **con_cls, void *cls,
+                                    struct MHD_Connection *conn, const char *path,
                                     const char *method, const char *version,
-                                    const char *upload_data, size_t *upload_data_size,
-                                    struct request *req) {
+                                    const char *upload_data, size_t *upload_data_size) {
+	struct server_info *srv_info = cls;
 
-	// Parse request headers
-	MHD_get_connection_values(conn, MHD_HEADER_KIND, &parse_header, req->headers);
-
-	// Is this a localhost request?
-	const char *host = hash_get(req->headers, "host");
-	if (host == NULL ||
-	    str_starts_with(host, "localhost") ||
-	    str_starts_with(host, "0.0.0.0") ||
-	    str_starts_with(host, "127.0.0.1"))
-		req->is_localhost = true;
-
-	const union MHD_ConnectionInfo *ci = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_CLIENT_ADDRESS);
-	if (ci != NULL && ci->client_addr->sa_family == AF_INET) {
-		struct sockaddr_in *in = (struct sockaddr_in *)ci->client_addr;
-		req->remote = strdup(inet_ntoa(in->sin_addr));
+	struct request *req = malloc(sizeof *req);
+	if (req == NULL) {
+		DEBUG_PRINT("Failed allocating request: %s\n", strerror(errno));
+		return MHD_NO;
 	}
 
-	char *fullpath = get_fullpath(req, path);
+	req->is_safe = strcmp(method, "GET") == 0
+	               || strcmp(method, "HEAD") == 0
+	               || strcmp(method, "OPTIONS") == 0;
+	req->version = version;
+	req->method = method;
+	req->url = curl_url();
+	req->raw_path = path;
+	req->dec_path = NULL;
+	req->remote = NULL;
+	req->postprocessor = NULL;
+	req->headers = NULL;
+	req->body_params = NULL;
+	req->num_supported_encodings = 0;
+	memset(req->supported_encodings, 0, sizeof(req->supported_encodings));
+	req->res = NULL;
+	req->resp = NULL;
+
+	*con_cls = (void*)req;
+
+	// Parse request headers
+	MHD_get_connection_values(conn, MHD_HEADER_KIND, &parse_header, req);
+
+	// Is this a localhost request?
+	struct param *hostp = NULL;
+	HASH_FIND_STR(req->headers, "host", hostp);
+	if (hostp)
+		req->host = hostp->value;
+
+	// Parse scheme and remote client
+	const union MHD_ConnectionInfo *info = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_PROTOCOL|MHD_CONNECTION_INFO_CLIENT_ADDRESS);
+	req->scheme = "http";
+	if (info != NULL) {
+		if (info->protocol) {
+			req->scheme = "https";
+		}
+		if (info->client_addr->sa_family == AF_INET) {
+			struct sockaddr_in *in = (struct sockaddr_in *)info->client_addr;
+			req->remote = strdup(inet_ntoa(in->sin_addr));
+		}
+	}
+
+	// Parse the request path, constructing a full URL, an unescaped path and a
+	// query string
+	size_t urlen = strlen(req->scheme) + 3 + strlen(req->host) + strlen(req->raw_path);
+	char url[urlen+1];
+	snprintf(url, urlen+1, "%s://%s%s", req->scheme, req->host, req->raw_path);
+
+	CURLUcode rc = curl_url_set(req->url, CURLUPART_URL, url, 0);
+	if (rc != CURLE_OK) {
+		fprintf(stderr, "Failed parsing request URL %s: %s\n", url, curl_url_strerror(rc));
+		return MHD_NO;
+	}
+
+	MHD_get_connection_values(conn, MHD_GET_ARGUMENT_KIND, &build_qs, req);
+
+	rc = curl_url_get(req->url, CURLUPART_PATH, &req->dec_path, CURLU_URLENCODE);
+	if (rc != CURLE_OK) {
+		req->dec_path = strdup(path);
+	}
+
+	// Locate the requested resource in the file system
+	char *fullpath = get_fullpath(req, req->dec_path);
+
 	if (fullpath == NULL) {
 		DEBUG_PRINT("Full path is NULL\n");
 		return MHD_NO;
@@ -475,45 +451,55 @@ static enum MHD_Result init_request(void *cls, struct MHD_Connection *conn, cons
 
 	DEBUG_PRINT("Full path is %s\n", fullpath);
 
-	req->res = locate_resource(req, fullpath, false);
+	req->res = locate_resource_in_fs(req, fullpath, false);
 	if (req->res == NULL) {
 		DEBUG_PRINT("Resource is NULL\n");
 		return MHD_NO;
 	}
 
-	DEBUG_PRINT("Final path is %s\n", req->res->fullpath);
+	DEBUG_PRINT("File path is %s\n", req->res->fullpath);
 
-	return parse_request(conn, path, method, upload_data, upload_data_size, req);
+	if (req->res->type != PSGI && !request_is_safe(method)) {
+		// TODO: need to returned Method Not Allowed
+		return MHD_NO;
+	}
+
+	// Parse the Accept-Encoding header so we know which compression algorithms
+	// the client supports
+	parse_accept_encoding(req);
+
+	if (method[0] == 'P') {
+		struct param *ct = NULL;
+		HASH_FIND_STR(req->headers, "content-type", ct);
+		if (ct != NULL) {
+			req->postprocessor = MHD_create_post_processor(
+				conn, 65536, &iterate_post, (void *)&req);
+
+			if (req->postprocessor == NULL) {
+				DEBUG_PRINT("POST processor is NULL\n");
+				return MHD_NO;
+			}
+		}
+	}
+
+	return MHD_YES;
 }
 
 enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn, const char *path,
                            const char *method, const char *version,
                            const char *upload_data, size_t *upload_data_size,
                            void **con_cls) {
-	if (*con_cls == NULL) {
-		struct request *req = malloc(sizeof *req);
-		if (req == NULL) {
-			DEBUG_PRINT("Request is NULL\n");
-			return MHD_NO;
-		}
-
-		req->status = 0;
-		req->res = NULL;
-		req->is_localhost = false;
-		req->remote = NULL;
-		req->postprocessor = NULL;
-		req->headers = hash_new();
-		req->body_params = hash_new();
-
-		*con_cls = (void*)req;
-
-		return init_request(cls, conn, path, method, version, upload_data, upload_data_size, req);
-	}
-
 	struct server_info *srv_info = cls;
-	struct request *req = *con_cls;
 
-	if (req->postprocessor != NULL && *upload_data_size != 0) {
+	if (*con_cls == NULL)
+		return init_request(con_cls, cls, conn, path, method, version, upload_data, upload_data_size);
+
+	struct request *req = *con_cls;
+	int ret = MHD_NO;
+
+	// If request is unsafe (i.e. not GET/HEAD/etc.) and has a POST processor,
+	// execute it
+	if (!req->is_safe && req->postprocessor != NULL && *upload_data_size != 0) {
 		// upload not yet done
 		if (MHD_post_process(req->postprocessor, upload_data, *upload_data_size) != MHD_YES) {
 			DEBUG_PRINT("POST processing failed\n");
@@ -525,12 +511,28 @@ enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn, const char *p
 		return MHD_YES;
 	}
 
-	int ret = serve_resource(srv_info, conn, req);
+	// If request is safe, try serving it from cache.
+	if (req->is_safe) {
+		ret = try_serving_from_cache(srv_info, conn, req);
+		if (ret == MHD_YES)
+			goto cleanup;
+	}
 
+	// Serving from cache failed, let's serve the file based on its type.
+	switch (req->res->type) {
+	case PSGI:
+		ret = serve_psgi(conn, req);
+		break;
+	default:
+		ret = serve_file(srv_info, conn, req);
+	}
+
+cleanup:
 	write_access_log(method, path, version, req, ret);
 
 	return ret;
 }
+
 
 static int sandbox(char *root) {
 	int rc = 0;
@@ -558,18 +560,42 @@ static int sandbox(char *root) {
 			return rc;
 		}
 
-		rc = unveil("/etc/ssl/cert.pem", "r");
-		if (rc == -1) {
-			fprintf(stderr, "Failed unveiling certificates\n");
-			return rc;
-		}
-
 		rc = unveil(NULL, NULL);
 		if (rc == -1) {
 			fprintf(stderr, "Failed closing unveil: %s\n", strerror(errno));
 			return rc;
 		}
 	}
+
+	return 0;
+}
+
+static int load_config(struct server_info *srv_info) {
+	config_t config;
+	config_init(&config);
+	int rc = config_read_file(&config, "sheepwool.conf");
+	if (rc != CONFIG_TRUE) {
+		fprintf(stderr, "WARN: Failed parsing config file %s [%d]: %s\n", config_error_file(&config), config_error_line(&config), config_error_text(&config));
+		config_destroy(&config);
+		return 1;
+	}
+
+	config_lookup_string(&config, "default_title", &srv_info->default_title);
+
+	config_setting_t *ignore = config_lookup(&config, "ignore");
+	if (ignore != NULL) {
+		int count = config_setting_length(ignore);
+		srv_info->ignore = malloc(sizeof(char *)*count);
+		if (srv_info->ignore == NULL) {
+			fprintf(stderr, "Failed allocating memory for ignore array: %s\n", strerror(errno));
+			return 1;
+		}
+
+		for (int i = 0; i < count; i++)
+			srv_info->ignore[i] = config_setting_get_string_elem(ignore, i);
+	}
+
+	config_destroy(&config);
 
 	return 0;
 }
@@ -627,8 +653,6 @@ static void sig_handler(int _) {
 }
 
 int main(int argc, char **argv, char **env) {
-	PERL_SYS_INIT3(&argc, &argv, &env);
-
 	signal(SIGINT, sig_handler);
 
 	struct server_info srv_info;
@@ -639,6 +663,12 @@ int main(int argc, char **argv, char **env) {
 	int rc = cmdline_parser(argc, argv, &params);
 	if ( rc != 0 )
 		goto cleanup;
+
+	DEBUG_PRINT("Starting perl interpreter...\n");
+	rc = start_perl(argc, argv, env);
+	if (rc)
+		goto cleanup;
+	DEBUG_PRINT("Perl interpreter started.\n");
 
 	// Determine the root directory we are saving, and chdir to it if necessary
 	char *root = get_root_directory(&params);
@@ -657,11 +687,27 @@ int main(int argc, char **argv, char **env) {
 	if (rc)
 		goto cleanup;
 
+	rc = curl_global_init(CURL_GLOBAL_DEFAULT);
+	if (rc) {
+		fprintf(stderr, "Failed initializing libcurl\n");
+		goto cleanup;
+	}
+
+	srv_info.curl = curl_easy_init();
+	if (srv_info.curl == NULL) {
+		rc = 1;
+		fprintf(stderr, "Failed initializing libcurl's easy interface\n");
+		goto cleanup;
+	}
+
+	// Load configuration
+	load_config(&srv_info);
+
 	// Start the HTTP server
 	unsigned int mhd_flags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG;
-	if (HAVE_EPOLL)
+	if (MHD_is_feature_supported(MHD_FEATURE_EPOLL))
 		mhd_flags |= MHD_USE_EPOLL;
-	else if (HAVE_POLL)
+	else if (MHD_is_feature_supported(MHD_FEATURE_POLL))
 		mhd_flags |= MHD_USE_POLL;
 #ifdef DEBUG
 	mhd_flags |= MHD_USE_DEBUG;
@@ -669,6 +715,8 @@ int main(int argc, char **argv, char **env) {
 #else
 	long int thread_pool_size = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
+
+	DEBUG_PRINT("Starting HTTP server...\n");
 
 	daemon = MHD_start_daemon(
 		mhd_flags, params.port_arg,
@@ -694,10 +742,14 @@ cleanup:
 		MHD_stop_daemon(daemon);
 	}
 
+	if (srv_info.curl != NULL)
+		curl_easy_init();
+	curl_global_cleanup();
+
 	if (srv_info.magic_db != NULL)
 		magic_close(srv_info.magic_db);
 
-	PERL_SYS_TERM();
+	destroy_perl();
 
 	exit(rc ? EXIT_FAILURE : EXIT_SUCCESS);
 }

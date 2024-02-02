@@ -15,6 +15,7 @@ vendor
 .deps
 src/cmdline.h
 src/cmdline.c
+src/xsinit.c
 .dirstamp
 sheepwool
 libtool

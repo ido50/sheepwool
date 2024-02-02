@@ -619,7 +619,7 @@ PACKAGE_STRING='SheepWool 6.0.0'
 PACKAGE_BUGREPORT='sheepwool@ido50.net'
 PACKAGE_URL='https://github.com/ido50/sheepwool'
 
-ac_unique_file="src/main.c"
+ac_unique_file="src/sheepwool.c"
 # Factoring default headers for most tests.
 ac_includes_default="\
 #include <stddef.h>
@@ -656,6 +656,14 @@ ac_subst_vars='am__EXEEXT_FALSE
 am__EXEEXT_TRUE
 LTLIBOBJS
 LIBOBJS
+LIBBROTLIENC_LIBS
+LIBBROTLIENC_CFLAGS
+LIBPCRE_LIBS
+LIBPCRE_CFLAGS
+LIBCURL_LIBS
+LIBCURL_CFLAGS
+LIBCONFIG_LIBS
+LIBCONFIG_CFLAGS
 LIBMICROHTTPD_LIBS
 LIBMICROHTTPD_CFLAGS
 LIBMAGIC_LIBS
@@ -797,8 +805,8 @@ enable_dependency_tracking
 with_gnu_ld
 with_sysroot
 enable_libtool_lock
-enable_epoll
-enable_poll
+with_zlib
+with_brotli
 '
       ac_precious_vars='build_alias
 host_alias
@@ -815,7 +823,15 @@ PKG_CONFIG_LIBDIR
 LIBMAGIC_CFLAGS
 LIBMAGIC_LIBS
 LIBMICROHTTPD_CFLAGS
-LIBMICROHTTPD_LIBS'
+LIBMICROHTTPD_LIBS
+LIBCONFIG_CFLAGS
+LIBCONFIG_LIBS
+LIBCURL_CFLAGS
+LIBCURL_LIBS
+LIBPCRE_CFLAGS
+LIBPCRE_LIBS
+LIBBROTLIENC_CFLAGS
+LIBBROTLIENC_LIBS'
 
 
 # Initialize some variables set by options.
@@ -1456,8 +1472,6 @@ Optional Features:
   --disable-dependency-tracking
                           speeds up one-time build
   --disable-libtool-lock  avoid locking (might break parallel builds)
-  --enable-epoll          This platform supports epoll(7)
-  --enable-poll           This platform supports poll(7)
 
 Optional Packages:
   --with-PACKAGE[=ARG]    use PACKAGE [ARG=yes]
@@ -1470,6 +1484,10 @@ Optional Packages:
   --with-gnu-ld           assume the C compiler uses GNU ld [default=no]
   --with-sysroot[=DIR]    Search for dependent libraries within DIR (or the
                           compiler's sysroot if not specified).
+  --with-zlib=DIR         root directory path of zlib installation [defaults to
+                          /usr/local or /usr if not found in /usr/local]
+  --without-zlib          to disable zlib usage completely
+  --with-brotli           Build with brotli compression support
 
 Some influential environment variables:
   CC          C compiler command
@@ -1494,6 +1512,22 @@ Some influential environment variables:
               C compiler flags for LIBMICROHTTPD, overriding pkg-config
   LIBMICROHTTPD_LIBS
               linker flags for LIBMICROHTTPD, overriding pkg-config
+  LIBCONFIG_CFLAGS
+              C compiler flags for LIBCONFIG, overriding pkg-config
+  LIBCONFIG_LIBS
+              linker flags for LIBCONFIG, overriding pkg-config
+  LIBCURL_CFLAGS
+              C compiler flags for LIBCURL, overriding pkg-config
+  LIBCURL_LIBS
+              linker flags for LIBCURL, overriding pkg-config
+  LIBPCRE_CFLAGS
+              C compiler flags for LIBPCRE, overriding pkg-config
+  LIBPCRE_LIBS
+              linker flags for LIBPCRE, overriding pkg-config
+  LIBBROTLIENC_CFLAGS
+              C compiler flags for LIBBROTLIENC, overriding pkg-config
+  LIBBROTLIENC_LIBS
+              linker flags for LIBBROTLIENC, overriding pkg-config
 
 Use these variables to override the choices made by 'configure' or to help
 it to find libraries and programs with nonstandard names/locations.
@@ -13024,11 +13058,6 @@ LDFLAGS="$LDFLAGS $PERLXS_LDFLAGS"
 
 
 
-{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: CFLAGS are: ${CFLAGS}" >&5
-printf "%s\n" "$as_me: WARNING: CFLAGS are: ${CFLAGS}" >&2;}
-{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: LDFLAGS are: ${LDFLAGS}" >&5
-printf "%s\n" "$as_me: WARNING: LDFLAGS are: ${LDFLAGS}" >&2;}
-
 
 
 
@@ -13346,6 +13375,532 @@ printf "%s\n" "yes" >&6; }
 
 fi
 
+pkg_failed=no
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for libconfig" >&5
+printf %s "checking for libconfig... " >&6; }
+
+if test -n "$LIBCONFIG_CFLAGS"; then
+    pkg_cv_LIBCONFIG_CFLAGS="$LIBCONFIG_CFLAGS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"libconfig\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "libconfig") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_LIBCONFIG_CFLAGS=`$PKG_CONFIG --cflags "libconfig" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+if test -n "$LIBCONFIG_LIBS"; then
+    pkg_cv_LIBCONFIG_LIBS="$LIBCONFIG_LIBS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"libconfig\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "libconfig") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_LIBCONFIG_LIBS=`$PKG_CONFIG --libs "libconfig" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+
+
+
+if test $pkg_failed = yes; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+
+if $PKG_CONFIG --atleast-pkgconfig-version 0.20; then
+        _pkg_short_errors_supported=yes
+else
+        _pkg_short_errors_supported=no
+fi
+        if test $_pkg_short_errors_supported = yes; then
+                LIBCONFIG_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "libconfig" 2>&1`
+        else
+                LIBCONFIG_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "libconfig" 2>&1`
+        fi
+        # Put the nasty error message in config.log where it belongs
+        echo "$LIBCONFIG_PKG_ERRORS" >&5
+
+        as_fn_error $? "Package requirements (libconfig) were not met:
+
+$LIBCONFIG_PKG_ERRORS
+
+Consider adjusting the PKG_CONFIG_PATH environment variable if you
+installed software in a non-standard prefix.
+
+Alternatively, you may set the environment variables LIBCONFIG_CFLAGS
+and LIBCONFIG_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details." "$LINENO" 5
+elif test $pkg_failed = untried; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+        { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+as_fn_error $? "The pkg-config script could not be found or is too old.  Make sure it
+is in your PATH or set the PKG_CONFIG environment variable to the full
+path to pkg-config.
+
+Alternatively, you may set the environment variables LIBCONFIG_CFLAGS
+and LIBCONFIG_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details.
+
+To get pkg-config, see <http://pkg-config.freedesktop.org/>.
+See 'config.log' for more details" "$LINENO" 5; }
+else
+        LIBCONFIG_CFLAGS=$pkg_cv_LIBCONFIG_CFLAGS
+        LIBCONFIG_LIBS=$pkg_cv_LIBCONFIG_LIBS
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+fi
+
+pkg_failed=no
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for libcurl" >&5
+printf %s "checking for libcurl... " >&6; }
+
+if test -n "$LIBCURL_CFLAGS"; then
+    pkg_cv_LIBCURL_CFLAGS="$LIBCURL_CFLAGS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"libcurl\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "libcurl") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_LIBCURL_CFLAGS=`$PKG_CONFIG --cflags "libcurl" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+if test -n "$LIBCURL_LIBS"; then
+    pkg_cv_LIBCURL_LIBS="$LIBCURL_LIBS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"libcurl\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "libcurl") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_LIBCURL_LIBS=`$PKG_CONFIG --libs "libcurl" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+
+
+
+if test $pkg_failed = yes; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+
+if $PKG_CONFIG --atleast-pkgconfig-version 0.20; then
+        _pkg_short_errors_supported=yes
+else
+        _pkg_short_errors_supported=no
+fi
+        if test $_pkg_short_errors_supported = yes; then
+                LIBCURL_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "libcurl" 2>&1`
+        else
+                LIBCURL_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "libcurl" 2>&1`
+        fi
+        # Put the nasty error message in config.log where it belongs
+        echo "$LIBCURL_PKG_ERRORS" >&5
+
+        as_fn_error $? "Package requirements (libcurl) were not met:
+
+$LIBCURL_PKG_ERRORS
+
+Consider adjusting the PKG_CONFIG_PATH environment variable if you
+installed software in a non-standard prefix.
+
+Alternatively, you may set the environment variables LIBCURL_CFLAGS
+and LIBCURL_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details." "$LINENO" 5
+elif test $pkg_failed = untried; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+        { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+as_fn_error $? "The pkg-config script could not be found or is too old.  Make sure it
+is in your PATH or set the PKG_CONFIG environment variable to the full
+path to pkg-config.
+
+Alternatively, you may set the environment variables LIBCURL_CFLAGS
+and LIBCURL_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details.
+
+To get pkg-config, see <http://pkg-config.freedesktop.org/>.
+See 'config.log' for more details" "$LINENO" 5; }
+else
+        LIBCURL_CFLAGS=$pkg_cv_LIBCURL_CFLAGS
+        LIBCURL_LIBS=$pkg_cv_LIBCURL_LIBS
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+fi
+
+pkg_failed=no
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for libpcre" >&5
+printf %s "checking for libpcre... " >&6; }
+
+if test -n "$LIBPCRE_CFLAGS"; then
+    pkg_cv_LIBPCRE_CFLAGS="$LIBPCRE_CFLAGS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"libpcre\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "libpcre") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_LIBPCRE_CFLAGS=`$PKG_CONFIG --cflags "libpcre" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+if test -n "$LIBPCRE_LIBS"; then
+    pkg_cv_LIBPCRE_LIBS="$LIBPCRE_LIBS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"libpcre\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "libpcre") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_LIBPCRE_LIBS=`$PKG_CONFIG --libs "libpcre" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+
+
+
+if test $pkg_failed = yes; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+
+if $PKG_CONFIG --atleast-pkgconfig-version 0.20; then
+        _pkg_short_errors_supported=yes
+else
+        _pkg_short_errors_supported=no
+fi
+        if test $_pkg_short_errors_supported = yes; then
+                LIBPCRE_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "libpcre" 2>&1`
+        else
+                LIBPCRE_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "libpcre" 2>&1`
+        fi
+        # Put the nasty error message in config.log where it belongs
+        echo "$LIBPCRE_PKG_ERRORS" >&5
+
+        as_fn_error $? "Package requirements (libpcre) were not met:
+
+$LIBPCRE_PKG_ERRORS
+
+Consider adjusting the PKG_CONFIG_PATH environment variable if you
+installed software in a non-standard prefix.
+
+Alternatively, you may set the environment variables LIBPCRE_CFLAGS
+and LIBPCRE_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details." "$LINENO" 5
+elif test $pkg_failed = untried; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+        { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+as_fn_error $? "The pkg-config script could not be found or is too old.  Make sure it
+is in your PATH or set the PKG_CONFIG environment variable to the full
+path to pkg-config.
+
+Alternatively, you may set the environment variables LIBPCRE_CFLAGS
+and LIBPCRE_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details.
+
+To get pkg-config, see <http://pkg-config.freedesktop.org/>.
+See 'config.log' for more details" "$LINENO" 5; }
+else
+        LIBPCRE_CFLAGS=$pkg_cv_LIBPCRE_CFLAGS
+        LIBPCRE_LIBS=$pkg_cv_LIBPCRE_LIBS
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+fi
+#
+# Handle user hints
+#
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking if zlib is wanted" >&5
+printf %s "checking if zlib is wanted... " >&6; }
+zlib_places="/usr/local /usr /opt/local /sw"
+
+# Check whether --with-zlib was given.
+if test ${with_zlib+y}
+then :
+  withval=$with_zlib; if test "$withval" != no ; then
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+  if test -d "$withval"
+  then
+    zlib_places="$withval $zlib_places"
+  else
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: Sorry, $withval does not exist, checking usual places" >&5
+printf "%s\n" "$as_me: WARNING: Sorry, $withval does not exist, checking usual places" >&2;}
+  fi
+else
+  zlib_places=
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+fi
+else case e in #(
+  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; } ;;
+esac
+fi
+
+
+#
+# Locate zlib, if wanted
+#
+if test -n "${zlib_places}"
+then
+	# check the user supplied or any other more or less 'standard' place:
+	#   Most UNIX systems      : /usr/local and /usr
+	#   MacPorts / Fink on OSX : /opt/local respectively /sw
+	for ZLIB_HOME in ${zlib_places} ; do
+	  if test -f "${ZLIB_HOME}/include/zlib.h"; then break; fi
+	  ZLIB_HOME=""
+	done
+
+  ZLIB_OLD_LDFLAGS=$LDFLAGS
+  ZLIB_OLD_CPPFLAGS=$CPPFLAGS
+  if test -n "${ZLIB_HOME}"; then
+        LDFLAGS="$LDFLAGS -L${ZLIB_HOME}/lib"
+        CPPFLAGS="$CPPFLAGS -I${ZLIB_HOME}/include"
+  fi
+  ac_ext=c
+ac_cpp='$CPP $CPPFLAGS'
+ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_c_compiler_gnu
+
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for inflateEnd in -lz" >&5
+printf %s "checking for inflateEnd in -lz... " >&6; }
+if test ${ac_cv_lib_z_inflateEnd+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_lib_save_LIBS=$LIBS
+LIBS="-lz  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char inflateEnd (void);
+int
+main (void)
+{
+return inflateEnd ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  ac_cv_lib_z_inflateEnd=yes
+else case e in #(
+  e) ac_cv_lib_z_inflateEnd=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS ;;
+esac
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_z_inflateEnd" >&5
+printf "%s\n" "$ac_cv_lib_z_inflateEnd" >&6; }
+if test "x$ac_cv_lib_z_inflateEnd" = xyes
+then :
+  zlib_cv_libz=yes
+else case e in #(
+  e) zlib_cv_libz=no ;;
+esac
+fi
+
+  ac_fn_c_check_header_compile "$LINENO" "zlib.h" "ac_cv_header_zlib_h" "$ac_includes_default"
+if test "x$ac_cv_header_zlib_h" = xyes
+then :
+  zlib_cv_zlib_h=yes
+else case e in #(
+  e) zlib_cv_zlib_h=no ;;
+esac
+fi
+
+  ac_ext=c
+ac_cpp='$CPP $CPPFLAGS'
+ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_c_compiler_gnu
+
+  if test "$zlib_cv_libz" = "yes" && test "$zlib_cv_zlib_h" = "yes"
+  then
+    #
+    # If both library and header were found, action-if-found
+    #
+
+                CPPFLAGS="$CPPFLAGS -I${ZLIB_HOME}/include"
+                LDFLAGS="$LDFLAGS -L${ZLIB_HOME}/lib"
+                LIBS="-lz $LIBS"
+
+printf "%s\n" "#define HAVE_LIBZ 1" >>confdefs.h
+
+
+  else
+    #
+    # If either header or library was not found, action-if-not-found
+    #
+
+                as_fn_error $? "either specify a valid zlib installation with --with-zlib=DIR or disable zlib usage with --without-zlib" "$LINENO" 5
+
+  fi
+fi
+
+
+
+# Check whether --with-brotli was given.
+if test ${with_brotli+y}
+then :
+  withval=$with_brotli;
+fi
+
+if test "x$with_brotli" = "xyes"
+then :
+
+
+pkg_failed=no
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for libbrotlienc" >&5
+printf %s "checking for libbrotlienc... " >&6; }
+
+if test -n "$LIBBROTLIENC_CFLAGS"; then
+    pkg_cv_LIBBROTLIENC_CFLAGS="$LIBBROTLIENC_CFLAGS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"libbrotlienc\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "libbrotlienc") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_LIBBROTLIENC_CFLAGS=`$PKG_CONFIG --cflags "libbrotlienc" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+if test -n "$LIBBROTLIENC_LIBS"; then
+    pkg_cv_LIBBROTLIENC_LIBS="$LIBBROTLIENC_LIBS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"libbrotlienc\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "libbrotlienc") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_LIBBROTLIENC_LIBS=`$PKG_CONFIG --libs "libbrotlienc" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+
+
+
+if test $pkg_failed = yes; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+
+if $PKG_CONFIG --atleast-pkgconfig-version 0.20; then
+        _pkg_short_errors_supported=yes
+else
+        _pkg_short_errors_supported=no
+fi
+        if test $_pkg_short_errors_supported = yes; then
+                LIBBROTLIENC_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "libbrotlienc" 2>&1`
+        else
+                LIBBROTLIENC_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "libbrotlienc" 2>&1`
+        fi
+        # Put the nasty error message in config.log where it belongs
+        echo "$LIBBROTLIENC_PKG_ERRORS" >&5
+
+        as_fn_error $? "Package requirements (libbrotlienc) were not met:
+
+$LIBBROTLIENC_PKG_ERRORS
+
+Consider adjusting the PKG_CONFIG_PATH environment variable if you
+installed software in a non-standard prefix.
+
+Alternatively, you may set the environment variables LIBBROTLIENC_CFLAGS
+and LIBBROTLIENC_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details." "$LINENO" 5
+elif test $pkg_failed = untried; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+        { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+as_fn_error $? "The pkg-config script could not be found or is too old.  Make sure it
+is in your PATH or set the PKG_CONFIG environment variable to the full
+path to pkg-config.
+
+Alternatively, you may set the environment variables LIBBROTLIENC_CFLAGS
+and LIBBROTLIENC_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details.
+
+To get pkg-config, see <http://pkg-config.freedesktop.org/>.
+See 'config.log' for more details" "$LINENO" 5; }
+else
+        LIBBROTLIENC_CFLAGS=$pkg_cv_LIBBROTLIENC_CFLAGS
+        LIBBROTLIENC_LIBS=$pkg_cv_LIBBROTLIENC_LIBS
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+fi
+
+printf "%s\n" "#define HAVE_BROTLI 1" >>confdefs.h
+
+
+fi
+
 ac_fn_c_check_type "$LINENO" "_Bool" "ac_cv_type__Bool" "$ac_includes_default"
 if test "x$ac_cv_type__Bool" = xyes
 then :
@@ -13456,6 +14011,20 @@ then :
 
 fi
 
+ac_fn_c_check_header_compile "$LINENO" "uthash.h" "ac_cv_header_uthash_h" "$ac_includes_default"
+if test "x$ac_cv_header_uthash_h" = xyes
+then :
+  printf "%s\n" "#define HAVE_UTHASH_H 1" >>confdefs.h
+
+fi
+
+ac_fn_c_check_header_compile "$LINENO" "utarray.h" "ac_cv_header_utarray_h" "$ac_includes_default"
+if test "x$ac_cv_header_utarray_h" = xyes
+then :
+  printf "%s\n" "#define HAVE_UTARRAY_H 1" >>confdefs.h
+
+fi
+
 ac_fn_c_check_func "$LINENO" "strtol" "ac_cv_func_strtol"
 if test "x$ac_cv_func_strtol" = xyes
 then :
@@ -13512,205 +14081,10 @@ fi
 
 done
 
-
-  ax_have_epoll_cppflags="${CPPFLAGS}"
-  ac_fn_c_check_header_compile "$LINENO" "linux/version.h" "ac_cv_header_linux_version_h" "$ac_includes_default"
-if test "x$ac_cv_header_linux_version_h" = xyes
-then :
-  CPPFLAGS="${CPPFLAGS} -DHAVE_LINUX_VERSION_H"
-fi
-
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for Linux epoll(7) interface" >&5
-printf %s "checking for Linux epoll(7) interface... " >&6; }
-  if test ${ax_cv_have_epoll+y}
-then :
-  printf %s "(cached) " >&6
-else case e in #(
-  e)     cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-      #include <sys/epoll.h>
-#ifdef HAVE_LINUX_VERSION_H
-#  include <linux/version.h>
-#  if LINUX_VERSION_CODE < KERNEL_VERSION(2,5,45)
-#    error linux kernel version is too old to have epoll
-#  endif
-#endif
-
-int
-main (void)
-{
-int fd;
-struct epoll_event ev;
-fd = epoll_create(128);
-epoll_wait(fd, &ev, 1, 0);
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_link "$LINENO"
-then :
-  ax_cv_have_epoll=yes
-else case e in #(
-  e) ax_cv_have_epoll=no ;;
-esac
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.beam \
-    conftest$ac_exeext conftest.$ac_ext ;;
-esac
-fi
-
-  CPPFLAGS="${ax_have_epoll_cppflags}"
-  if test "${ax_cv_have_epoll}" = "yes"
-then :
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
-printf "%s\n" "yes" >&6; }
-   ax_config_feature_epoll=yes
-
-else case e in #(
-  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
-printf "%s\n" "no" >&6; }
-   ax_config_feature_epoll=no
- ;;
-esac
-fi
-
-
-# Check whether --enable-epoll was given.
-if test ${enable_epoll+y}
-then :
-  enableval=$enable_epoll;
-case "${enableval}" in
-   yes)
-     ax_config_feature_epoll="yes"
-     ;;
-   no)
-     ax_config_feature_epoll="no"
-     ;;
-   *)
-     as_fn_error $? "bad value ${enableval} for feature --epoll" "$LINENO" 5
-     ;;
-esac
-
-fi
-
-
-if test "$ax_config_feature_epoll" = yes
-then :
-     printf "%s\n" "#define HAVE_EPOLL 1" >>confdefs.h
-
-
-  if test "$ax_config_feature_verbose" = yes
-then :
-       { printf "%s\n" "$as_me:${as_lineno-$LINENO}: Feature epoll is enabled" >&5
-printf "%s\n" "$as_me: Feature epoll is enabled" >&6;}
-
-fi
-
-else case e in #(
-  e)
-  if test "$ax_config_feature_verbose" = yes
-then :
-       { printf "%s\n" "$as_me:${as_lineno-$LINENO}: Feature epoll is disabled" >&5
-printf "%s\n" "$as_me: Feature epoll is disabled" >&6;}
-
-fi
- ;;
-esac
-fi
-
-
-
-
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for poll(2)" >&5
-printf %s "checking for poll(2)... " >&6; }
-  if test ${ax_cv_have_poll+y}
-then :
-  printf %s "(cached) " >&6
-else case e in #(
-  e)     cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-      #include <poll.h>
-int
-main (void)
-{
-int rc; rc = poll((struct pollfd *)(0), 0, 0);
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_link "$LINENO"
-then :
-  ax_cv_have_poll=yes
-else case e in #(
-  e) ax_cv_have_poll=no ;;
-esac
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.beam \
-    conftest$ac_exeext conftest.$ac_ext ;;
-esac
-fi
-
-  if test "${ax_cv_have_poll}" = "yes"
-then :
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
-printf "%s\n" "yes" >&6; }
-   ax_config_feature_poll=yes
-
-else case e in #(
-  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
-printf "%s\n" "no" >&6; }
-   ax_config_feature_poll=no
- ;;
-esac
-fi
-
-
-# Check whether --enable-poll was given.
-if test ${enable_poll+y}
-then :
-  enableval=$enable_poll;
-case "${enableval}" in
-   yes)
-     ax_config_feature_poll="yes"
-     ;;
-   no)
-     ax_config_feature_poll="no"
-     ;;
-   *)
-     as_fn_error $? "bad value ${enableval} for feature --poll" "$LINENO" 5
-     ;;
-esac
-
-fi
-
-
-if test "$ax_config_feature_poll" = yes
-then :
-     printf "%s\n" "#define HAVE_POLL 1" >>confdefs.h
-
-
-  if test "$ax_config_feature_verbose" = yes
-then :
-       { printf "%s\n" "$as_me:${as_lineno-$LINENO}: Feature poll is enabled" >&5
-printf "%s\n" "$as_me: Feature poll is enabled" >&6;}
-
-fi
-
-else case e in #(
-  e)
-  if test "$ax_config_feature_verbose" = yes
-then :
-       { printf "%s\n" "$as_me:${as_lineno-$LINENO}: Feature poll is disabled" >&5
-printf "%s\n" "$as_me: Feature poll is disabled" >&6;}
-
-fi
- ;;
-esac
-fi
-
-
-
-
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: CFLAGS are: ${CFLAGS}" >&5
+printf "%s\n" "$as_me: WARNING: CFLAGS are: ${CFLAGS}" >&2;}
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: LDFLAGS are: ${LDFLAGS}" >&5
+printf "%s\n" "$as_me: WARNING: LDFLAGS are: ${LDFLAGS}" >&2;}
 
 ac_config_files="$ac_config_files Makefile src/Makefile"
 
