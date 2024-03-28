@@ -40,7 +40,7 @@ static char *add_extension(const char *path, const char *ext) {
 
 	size_t new_path_len = path_len + ext_len + 2;
 
-	char *new_path = malloc(new_path_len);
+	char *new_path = calloc(1, new_path_len);
 	if (!new_path) {
 		fprintf(stderr, "Failed allocating memory for new path: %s\n", strerror(errno));
 		return NULL;

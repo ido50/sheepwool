@@ -1,6 +1,8 @@
 package Embed::Persistent;
 
 use strict;
+use Cwd;
+use IO::File;
 
 our %AppCache;
 
@@ -47,6 +49,12 @@ sub run_psgi {
             mtime => $mtime,
             app   => $app,
         };
+    }
+
+    if ( $env->{'psgi.input'} ) {
+        $env->{'psgi.input'} =
+          IO::File->new_from_fd( $env->{'psgi.input'}, "r" );
+        $env->{'psgix.input.buffered'} = 1;
     }
 
     my $res = eval { $app->($env) };

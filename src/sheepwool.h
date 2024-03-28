@@ -1,4 +1,5 @@
 #include <curl/curl.h>
+#include <libconfig.h>
 #include <magic.h>
 #include <microhttpd.h>
 #include <regex.h>
@@ -17,8 +18,8 @@
 struct server_info {
 	magic_t magic_db;
   CURL *curl;
-  const char *default_title;
-  const char **ignore;
+  char **ignore;
+  char *html_handler;
 };
 
 enum param_type {
@@ -88,6 +89,8 @@ struct request {
   struct header_choice supported_encodings[MAX_ENCODINGS];
   int num_supported_encodings;
   struct response *resp;
+  const char *delegate;
+  int input;
 };
 
 enum MHD_Result try_serving_from_cache(
@@ -97,7 +100,7 @@ enum MHD_Result try_serving_from_cache(
 int save_response_to_cache(struct server_info *srv_info, struct request *req);
 
 int start_perl(int argc, char **argv, char **env);
-enum MHD_Result serve_psgi(struct MHD_Connection *conn, struct request *req);
+enum MHD_Result serve_psgi(struct server_info *srv_info, struct MHD_Connection *conn, struct request *req);
 void destroy_perl(void);
 
 enum MHD_Result serve_html(struct server_info *srv_info, struct MHD_Connection *conn, struct request *req);

@@ -217,7 +217,7 @@ static struct resource *locate_resource_in_fs(struct request *req, char *fullpat
 		}
 
 		// Try with .html
-		fullpath = realloc(fullpath, strlen(fullpath) + 4 + 1);
+		fullpath = realloc(fullpath, strlen(fullpath) + 5 + 1);
 		if (fullpath == NULL) {
 			fprintf(stderr, "Failed reallocing fullpath: %s\n", strerror(errno));
 			abort();
@@ -393,6 +393,8 @@ static enum MHD_Result init_request(void **con_cls, void *cls,
 	req->postprocessor = NULL;
 	req->headers = NULL;
 	req->body_params = NULL;
+	req->delegate = NULL;
+	req->input = 0;
 	req->num_supported_encodings = 0;
 	memset(req->supported_encodings, 0, sizeof(req->supported_encodings));
 	req->res = NULL;
@@ -521,7 +523,10 @@ enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn, const char *p
 	// Serving from cache failed, let's serve the file based on its type.
 	switch (req->res->type) {
 	case PSGI:
-		ret = serve_psgi(conn, req);
+		ret = serve_psgi(srv_info, conn, req);
+		break;
+	case HTML:
+		ret = serve_html(srv_info, conn, req);
 		break;
 	default:
 		ret = serve_file(srv_info, conn, req);
@@ -573,6 +578,7 @@ static int sandbox(char *root) {
 static int load_config(struct server_info *srv_info) {
 	config_t config;
 	config_init(&config);
+
 	int rc = config_read_file(&config, "sheepwool.conf");
 	if (rc != CONFIG_TRUE) {
 		fprintf(stderr, "WARN: Failed parsing config file %s [%d]: %s\n", config_error_file(&config), config_error_line(&config), config_error_text(&config));
@@ -580,8 +586,7 @@ static int load_config(struct server_info *srv_info) {
 		return 1;
 	}
 
-	config_lookup_string(&config, "default_title", &srv_info->default_title);
-
+	srv_info->ignore = NULL;
 	config_setting_t *ignore = config_lookup(&config, "ignore");
 	if (ignore != NULL) {
 		int count = config_setting_length(ignore);
@@ -592,10 +597,12 @@ static int load_config(struct server_info *srv_info) {
 		}
 
 		for (int i = 0; i < count; i++)
-			srv_info->ignore[i] = config_setting_get_string_elem(ignore, i);
+			srv_info->ignore[i] = strdup(config_setting_get_string_elem(ignore, i));
 	}
 
-	config_destroy(&config);
+	const char *handler;
+	if (config_lookup_string(&config, "html_handler", &handler))
+		srv_info->html_handler = strdup(handler);
 
 	return 0;
 }
@@ -656,6 +663,8 @@ int main(int argc, char **argv, char **env) {
 	signal(SIGINT, sig_handler);
 
 	struct server_info srv_info;
+	srv_info.html_handler = NULL;
+
 	struct MHD_Daemon *daemon;
 
 	// Parse command line arguments
@@ -748,6 +757,9 @@ cleanup:
 
 	if (srv_info.magic_db != NULL)
 		magic_close(srv_info.magic_db);
+
+	if (srv_info.html_handler != NULL)
+		free(srv_info.html_handler);
 
 	destroy_perl();
 

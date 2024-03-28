@@ -98,8 +98,6 @@ static HV* create_psgi_env(struct request *req) {
 		return NULL;
 	}
 
-	DEBUG_PRINT("Query string is %s\n", qs);
-
 	HV *env = newHV();
 	hv_stores(env, "REQUEST_METHOD", newSVpv(req->method, 0));
 	hv_stores(env, "SCRIPT_NAME", newSVpv("", 0));
@@ -142,6 +140,10 @@ static HV* create_psgi_env(struct request *req) {
 	hv_stores(env, "psgi.streaming", newSViv(0));
 	hv_stores(env, "psgi.nonblocking", newSViv(1));
 
+	if (req->input)
+		hv_stores(env, "psgi.input", newSViv(req->input));
+	hv_stores(env, "psgi.errors", newSViv(2));
+
 	return env;
 }
 
@@ -151,7 +153,9 @@ static SV* eval_psgi(struct request *req) {
 	SV *res_rv = NULL;
 	HV *env = NULL;
 
-	DEBUG_PRINT("Evaluating PSGI script [%s]\n", req->res->fullpath);
+	const char *script = req->delegate ? req->delegate : req->res->fullpath;
+
+	DEBUG_PRINT("Evaluating PSGI script [%s]\n", script);
 
 	ENTER;
 	SAVETMPS;
@@ -162,7 +166,7 @@ static SV* eval_psgi(struct request *req) {
 
 	PUSHMARK(SP);
 	EXTEND(SP, 2);
-	PUSHs(sv_2mortal(newSVpv(req->res->fullpath, 0)));
+	PUSHs(sv_2mortal(newSVpv(script, 0)));
 	PUSHs(sv_2mortal(newRV_inc((SV*)env)));
 	PUTBACK;
 
@@ -172,7 +176,7 @@ static SV* eval_psgi(struct request *req) {
 
 	SV *err = ERRSV;
 	if (SvTRUE(err)) {
-		fprintf(stderr, "PSGI app %s failed: %s", req->res->fullpath, SvPV_nolen(err));
+		fprintf(stderr, "PSGI app %s failed: %s", script, SvPV_nolen(err));
 		POPs;
 		goto cleanup;
 	}
@@ -228,7 +232,8 @@ static unsigned char* parse_output_body(AV *res_av, size_t *size) {
 	return buffer;
 }
 
-enum MHD_Result serve_psgi(struct MHD_Connection *conn, struct request *req) {
+enum MHD_Result serve_psgi(struct server_info *srv_info,
+                           struct MHD_Connection *conn, struct request *req) {
 	PERL_SET_CONTEXT(my_perl);
 
 	enum MHD_Result res = MHD_NO;
