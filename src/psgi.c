@@ -142,6 +142,10 @@ static HV* create_psgi_env(struct request *req) {
 	hv_stores(env, "psgi.streaming", newSViv(0));
 	hv_stores(env, "psgi.nonblocking", newSViv(1));
 
+	if (req->input)
+		hv_stores(env, "psgi.input", newSViv(req->input));
+	hv_stores(env, "psgi.errors", newSViv(2));
+
 	return env;
 }
 
@@ -228,7 +232,8 @@ static unsigned char* parse_output_body(AV *res_av, size_t *size) {
 	return buffer;
 }
 
-enum MHD_Result serve_psgi(struct MHD_Connection *conn, struct request *req) {
+enum MHD_Result serve_psgi(struct server_info *srv_info,
+                           struct MHD_Connection *conn, struct request *req) {
 	PERL_SET_CONTEXT(my_perl);
 
 	enum MHD_Result res = MHD_NO;

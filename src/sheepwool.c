@@ -393,6 +393,7 @@ static enum MHD_Result init_request(void **con_cls, void *cls,
 	req->postprocessor = NULL;
 	req->headers = NULL;
 	req->body_params = NULL;
+	req->input = 0;
 	req->num_supported_encodings = 0;
 	memset(req->supported_encodings, 0, sizeof(req->supported_encodings));
 	req->res = NULL;
@@ -521,7 +522,10 @@ enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn, const char *p
 	// Serving from cache failed, let's serve the file based on its type.
 	switch (req->res->type) {
 	case PSGI:
-		ret = serve_psgi(conn, req);
+		ret = serve_psgi(srv_info, conn, req);
+		break;
+	case HTML:
+		ret = serve_html(srv_info, conn, req);
 		break;
 	default:
 		ret = serve_file(srv_info, conn, req);
@@ -580,8 +584,10 @@ static int load_config(struct server_info *srv_info) {
 		return 1;
 	}
 
-	config_lookup_string(&config, "default_title", &srv_info->default_title);
+	srv_info->html_handler = NULL;
+	config_lookup_string(&config, "html_handler", &srv_info->html_handler);
 
+	srv_info->ignore = NULL;
 	config_setting_t *ignore = config_lookup(&config, "ignore");
 	if (ignore != NULL) {
 		int count = config_setting_length(ignore);
