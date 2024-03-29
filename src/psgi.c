@@ -23,9 +23,9 @@
 #include "config.h"
 
 #include <ctype.h>
-#include <curl/curl.h>
 #include <errno.h>
-#include <microhttpd.h>
+#include <event2/buffer.h>
+#include <event2/http.h>
 #include <uthash.h>
 
 #include <EXTERN.h>
@@ -83,39 +83,22 @@ static void psgi_header_name(char *dest, const char *orig, int len) {
 	dest[len] = '\0';
 }
 
-static HV* create_psgi_env(struct request *req) {
-	char *path;
-	char *qs;
-	CURLUcode rc = curl_url_get(req->url, CURLUPART_PATH, &path, CURLU_URLDECODE);
-	if (rc != CURLUE_OK) {
-		fprintf(stderr, "Failed getting request path: %s\n", curl_url_strerror(rc));
-		return NULL;
-	}
-
-	rc = curl_url_get(req->url, CURLUPART_QUERY, &qs, CURLU_URLDECODE);
-	if (rc != CURLUE_OK && rc != CURLUE_NO_QUERY) {
-		fprintf(stderr, "Failed getting request query string: %s\n", curl_url_strerror(rc));
-		return NULL;
-	}
-
+static HV* create_psgi_env(struct evhttp_request *conn, struct request *req) {
 	HV *env = newHV();
-	hv_stores(env, "REQUEST_METHOD", newSVpv(req->method, 0));
+	hv_stores(env, "REQUEST_METHOD", newSVpv(req->method_str, 0));
 	hv_stores(env, "SCRIPT_NAME", newSVpv("", 0));
-	hv_stores(env, "PATH_INFO", newSVpv(path, 0));
-	hv_stores(env, "REQUEST_URI", newSVpv(req->raw_path, 0));
-	hv_stores(env, "QUERY_STRING", newSVpv(qs, 0));
-	hv_stores(env, "SERVER_PROTOCOL", newSVpv(req->version, 0));
-
-	curl_free(path);
-	curl_free(qs);
+	hv_stores(env, "PATH_INFO", newSVpv(req->path, 0));
+	hv_stores(env, "REQUEST_URI", newSVpv(evhttp_request_get_uri(conn), 0));
+	hv_stores(env, "QUERY_STRING", newSVpv(evhttp_uri_get_query(req->uri), 0));
+	hv_stores(env, "SERVER_PROTOCOL", newSVpv("1.1", 0));
 
 	bool is_https = false;
 
-	struct param *current_header, *tmp;
+	struct header *current_header, *tmp;
 	HASH_ITER(hh, req->headers, current_header, tmp) {
-		int len = 5 + strlen(current_header->name);
+		int len = 5 + strlen(current_header->key);
 		char header[len+1];
-		psgi_header_name(header, current_header->name, len);
+		psgi_header_name(header, current_header->key, len);
 
 		const char *val = current_header->value;
 
@@ -147,20 +130,21 @@ static HV* create_psgi_env(struct request *req) {
 	return env;
 }
 
-static SV* eval_psgi(struct request *req) {
+static SV* eval_psgi(
+	struct evhttp_request *conn, struct request *req, struct resource *res) {
 	dSP;
 	int count;
 	SV *res_rv = NULL;
 	HV *env = NULL;
 
-	const char *script = req->delegate ? req->delegate : req->res->fullpath;
+	const char *script = req->delegate ? req->delegate : res->fullpath;
 
 	DEBUG_PRINT("Evaluating PSGI script [%s]\n", script);
 
 	ENTER;
 	SAVETMPS;
 
-	env = create_psgi_env(req);
+	env = create_psgi_env(conn, req);
 	if (env == NULL)
 		goto cleanup;
 
@@ -197,79 +181,60 @@ cleanup:
 	return res_rv;
 }
 
-static unsigned char* parse_output_body(AV *res_av, size_t *size) {
+static struct evbuffer *parse_output_body(AV *res_av, size_t *size) {
 	SV *res_body = *(av_fetch(res_av, 2, 0));
 	AV *res_body_av = (AV *) SvRV(res_body);
 
-	unsigned char *buffer = NULL;
-	unsigned char *p = NULL;
-
-	*size = 0;
+	struct evbuffer *buffer = evbuffer_new();
 
 	for (I32 i = 0; i <= av_len(res_body_av); i++) {
 		SV *b = (SV *) *(av_fetch(res_body_av, i, 0));
 		if (SvOK(b)) {
 			STRLEN len;
 			char *line = SvPV(b, len);
-			*size += (size_t) len;
-
-			if (buffer == NULL) {
-				buffer = malloc(len+1);
-				p = buffer;
-			} else {
-				buffer = realloc(buffer, len+1);
-			}
-
-			if (buffer == NULL) {
-				fprintf(stderr, "Failed allocating memory for PSGI body: %s\n", strerror(errno));
-				return NULL;
-			}
-
-			p = stpcpy(p, line);
+			evbuffer_add(buffer, line, len);
+			*size += len;
 		}
 	}
 
 	return buffer;
 }
 
-enum MHD_Result serve_psgi(struct server_info *srv_info,
-                           struct MHD_Connection *conn, struct request *req) {
+
+struct response *serve_psgi(
+	struct server_info *srv_info,
+	struct evhttp_request *conn,
+	struct request *req,
+	struct resource *res) {
 	PERL_SET_CONTEXT(my_perl);
 
-	enum MHD_Result res = MHD_NO;
 	SV *res_rv = NULL;
 
-	res_rv = eval_psgi(req);
+	res_rv = eval_psgi(conn, req, res);
 	if (res_rv == NULL)
 		goto cleanup;
 
 	AV *res_av = (AV *)SvRV(res_rv);
 
-	req->resp = malloc(sizeof *req->resp);
-	req->resp->status = 0;
-	req->resp->size = 0;
-	req->resp->etag = NULL;
-	req->resp->location = NULL;
-	req->resp->content_type = NULL;
-	req->resp->content = NULL;
-	req->resp->backend = NULL;
-	req->resp->content_encoding = "none";
-
-	req->resp->content = parse_output_body(res_av, &req->resp->size);
-	if (req->resp->content == NULL)
-		goto cleanup;
-
-	// Process response status
-	SV *status = (SV *) *(av_fetch(res_av, 0, 0));
-
-	// Create the MHD response object from the body buffer
-	req->resp->backend = MHD_create_response_from_buffer(req->resp->size, req->resp->content, MHD_RESPMEM_MUST_COPY);
-	if (req->resp->backend == NULL) {
-		fprintf(stderr, "Failed creating response from buffer: %s\n", strerror(errno));
+	struct response *resp = malloc(sizeof *resp);
+	if (resp == NULL) {
+		fprintf(stderr, "Failed allocating for response: %s\n", strerror(errno));
 		goto cleanup;
 	}
 
-	// Process response header
+	resp->status = 0;
+	resp->etag = NULL;
+	resp->content_length = 0;
+	resp->content_type = NULL;
+	resp->content_encoding = NULL;
+	resp->content = NULL;
+	resp->extra_headers = NULL;
+
+	// Process response status
+	SV *status = (SV *) *(av_fetch(res_av, 0, 0));
+	resp->status = SvIV(status);
+
+	// Process response headers
 	SV *res_headers = *(av_fetch(res_av, 1, 0));
 	AV *res_headers_av = (AV *) SvRV(res_headers);
 
@@ -280,17 +245,34 @@ enum MHD_Result serve_psgi(struct server_info *srv_info,
 		if (key_sv == NULL || val_sv == NULL)
 			break;
 
-		MHD_add_response_header(req->resp->backend, SvPV_nolen(key_sv), SvPV_nolen(val_sv));
+		struct header *h = malloc(sizeof *h);
+		if (h == NULL) {
+			fprintf(stderr, "Failed allocating for output header: %s\n", strerror(errno));
+			resp = NULL;
+			goto cleanup;
+		}
+
+		h->key = SvPV_nolen(key_sv);
+
+		if (strcmp(h->key, "Content-Type") == 0) {
+			resp->content_type = SvPV_nolen(val_sv);
+		} else {
+			h->value = SvPV_nolen(val_sv);
+			HASH_ADD_STR(resp->extra_headers, key, h);
+		}
 
 		SvREFCNT_dec(key_sv);
 		SvREFCNT_dec(val_sv);
 	}
 
-	res = MHD_queue_response(conn, SvIV(status), req->resp->backend);
+	// Process response body
+	resp->content = parse_output_body(res_av, &resp->content_length);
 
 cleanup:
-	if (res_rv != NULL)
-		SvREFCNT_dec(res_rv);
+	if (res_rv == NULL)
+		return NULL;
 
-	return res;
+	SvREFCNT_dec(res_rv);
+
+	return resp;
 }

@@ -24,46 +24,46 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <microhttpd.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <uthash.h>
 
 #include "sheepwool.h"
 
-enum MHD_Result serve_html(struct server_info *srv_info,
-                           struct MHD_Connection *conn, struct request *req) {
+struct response *serve_html(
+	struct server_info *srv_info,
+	struct evhttp_request *conn,
+	struct request *req,
+	struct resource *res) {
 	if (srv_info->html_handler == NULL)
 		// We do not have an HTML handler, so we're just serving this as any other
 		// file
-		return serve_file(srv_info, conn, req);
+		return serve_file(srv_info, conn, req, res);
 
-	int rc = MHD_NO;
 	int fd = -1;
 
-	fd = open(req->res->fullpath, O_RDONLY);
+	fd = open(res->fullpath, O_RDONLY);
 	if (fd == -1) {
-		fprintf(stderr, "Failed opening file %s: %s\n", req->res->fullpath, strerror(errno));
-		return rc;
+		fprintf(stderr, "Failed opening file %s: %s\n", res->fullpath, strerror(errno));
+		return NULL;
 	}
 
 	char content_length[21];
-	struct param *header = malloc(sizeof *header);
-	header->name = "Content-Length";
-	snprintf(content_length, 21, "%ld", req->res->size);
+	struct header *header = malloc(sizeof *header);
+	header->key = "Content-Length";
+	snprintf(content_length, 21, "%ld", res->size);
 	header->value = content_length;
 
-	HASH_ADD_STR(req->headers, name, header);
+	HASH_ADD_STR(req->headers, key, header);
 
 	req->input = fd;
 	req->delegate = srv_info->html_handler;
 
 	DEBUG_PRINT("Delegating to %s\n", srv_info->html_handler);
 
-	rc = serve_psgi(srv_info, conn, req);
-
+	struct response *resp = serve_psgi(srv_info, conn, req, res);
 	close(fd);
-
-	return rc;
+	return resp;
 }

@@ -23,9 +23,10 @@
 #include "config.h"
 
 #include <errno.h>
+#include <event2/buffer.h>
+#include <event2/http.h>
 #include <fcntl.h>
 #include <magic.h>
-#include <microhttpd.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,20 +35,20 @@
 
 #include "sheepwool.h"
 
-static uLong calculate_etag(struct request *req) {
+static uLong calculate_etag(struct resource *res, struct response *resp) {
 	uLong crc = crc32(0L, Z_NULL, 0); // Initialize the CRC
 
-	if (req->resp->content_encoding != NULL) {
-		crc = crc32(crc, (const Bytef *)req->resp->content, req->resp->size);
+	if (resp->content_encoding != NULL) {
+		crc = crc32(crc, (const Bytef *)resp->content, resp->content_length);
 		return crc;
 	}
 
 	unsigned char buffer[1024];
 	size_t bytes_read;
 
-	FILE *file = fopen(req->res->fullpath, "rb");
+	FILE *file = fopen(res->fullpath, "rb");
 	if (file == NULL) {
-		fprintf(stderr, "Failed opening file %s: %s\n", req->res->fullpath, strerror(errno));
+		fprintf(stderr, "Failed opening file %s: %s\n", res->fullpath, strerror(errno));
 		return 0;
 	}
 
@@ -56,7 +57,7 @@ static uLong calculate_etag(struct request *req) {
 	}
 
 	if (ferror(file)) {
-		fprintf(stderr, "Failed reading file %s: %s\n", req->res->fullpath, strerror(errno));
+		fprintf(stderr, "Failed reading file %s: %s\n", res->fullpath, strerror(errno));
 		fclose(file);
 		return 0;
 	}
@@ -66,82 +67,87 @@ static uLong calculate_etag(struct request *req) {
 	return crc;
 }
 
-enum MHD_Result serve_file(struct server_info *srv_info,
-                           struct MHD_Connection *conn,
-                           struct request *req) {
-	req->resp = malloc(sizeof *req->resp);
-	if (req->resp == NULL) {
+struct response *serve_file(struct server_info *srv_info,
+                            struct evhttp_request *conn,
+                            struct request *req,
+                            struct resource *res) {
+	struct response *resp = malloc(sizeof *resp);
+	if (resp == NULL) {
 		fprintf(stderr, "Failed allocating for resource: %s\n", strerror(errno));
-		return MHD_NO;
+		return NULL;
 	}
 
-	req->resp->status = MHD_HTTP_OK;
-	req->resp->size = req->res->size;
-	req->resp->etag = NULL;
-	req->resp->location = NULL;
-	req->resp->content = NULL;
-	req->resp->content_encoding = "none";
-	req->resp->backend = NULL;
+	resp->status = HTTP_OK;
+	resp->content_length = res->size;
+	resp->etag = NULL;
+	resp->content = NULL;
+	resp->content_encoding = "none";
+	resp->extra_headers = NULL;
 
-	req->resp->content_type =
-		has_suffix(req->res->fullpath, ".css") ? strdup("text/css") :
-		strdup(magic_file(srv_info->magic_db, req->res->fullpath));
-	if (req->resp->content_type == NULL)
-		req->resp->content_type = strdup("text/plain");
+	resp->content_type =
+		has_suffix(res->fullpath, ".css") ? "text/css" :
+		magic_file(srv_info->magic_db, res->fullpath);
+	if (resp->content_type == NULL)
+		resp->content_type = "text/plain";
+
+	resp->content = evbuffer_new();
+	if (resp->content == NULL) {
+		fprintf(stderr, "Failed allocating for response buffer: %s\n", strerror(errno));
+		evhttp_send_error(conn, HTTP_INTERNAL, 0);
+		return NULL;
+	}
+
+	if (req->method == EVHTTP_REQ_OPTIONS) {
+		evhttp_add_header(evhttp_request_get_output_headers(conn), "Allow", "GET, HEAD, OPTIONS");
+		resp->content_length = 0;
+	}
 
 	// Compress the file if it's compressible and client supports it
-	if (!(is_compressible(req->resp->content_type) && compress_file(srv_info, req))) {
-		FILE *file = fopen(req->res->fullpath, "rb");
-		if (!file) {
-			fprintf(stderr, "Failed opening file %s: %s\n", req->res->fullpath, strerror(errno));
-			return MHD_NO;
-		}
+	if (is_compressible(resp->content_type)) {
+		evhttp_add_header(evhttp_request_get_output_headers(conn), "Vary", "Accept-Encoding");
 
-		req->resp->content = malloc(req->res->size + 1);
-		if (!req->resp->content) {
-			fprintf(stderr, "Failed allocating memory for file: %s\n", strerror(errno));
-			fclose(file);
-			return MHD_NO;
-		}
+		if (resp->content_length == 0)
+			return resp;
 
-		size_t bytesRead = fread(req->resp->content, 1, req->res->size, file);
-		if (bytesRead < req->res->size) {
-			fprintf(stderr, "Failed reading file: %s\n", strerror(errno));
-			fclose(file);
-			return MHD_NO;
-		}
+		unsigned char *compressed_content = compress_file(srv_info, req, res, resp);
+		if (compressed_content) {
+			DEBUG_PRINT(
+				"Compressed %s with %s to %lo bytes\n",
+				res->fullpath, resp->content_encoding, resp->content_length);
 
-		req->resp->content[bytesRead] = '\0';
-		req->resp->size = req->res->size;
+			// Calcualte the file's ETag
+			uLong etag = calculate_etag(res, resp);
+			if (etag > 0) {
+				resp->etag = malloc(11);
+				sprintf(resp->etag, "\"%08lx\"", etag);
+				resp->etag[10] = '\0';
+				DEBUG_PRINT("Calculated etag: %s\n", resp->etag);
+			}
+
+			char *compressed_path = save_response_to_cache(req, res, resp, compressed_content);
+			if (compressed_path) {
+				int fd = open(compressed_path, O_RDONLY);
+				if (fd == -1) {
+					fprintf(stderr, "Failed opening compressed representation %s: %s\n", compressed_path, strerror(errno));
+					return NULL;
+				}
+
+				evbuffer_add_file(resp->content, fd, 0, resp->content_length);
+				close(fd);
+				return resp;
+			}
+		}
 	}
 
-	req->resp->backend = MHD_create_response_from_buffer(
-		req->resp->size, req->resp->content, MHD_RESPMEM_PERSISTENT);
-
-	if (req->resp->backend == NULL) {
-		fprintf(stderr, "Failed creating response from fd: %s\n", strerror(errno));
-		return MHD_NO;
+	int fd = open(res->fullpath, O_RDONLY);
+	if (fd == -1) {
+		fprintf(stderr, "Failed opening file %s: %s\n", res->fullpath, strerror(errno));
+		return NULL;
 	}
 
-	// Calcualte the file's ETag
-	uLong etag = calculate_etag(req);
-	if (etag > 0) {
-		req->resp->etag = malloc(11);
-		sprintf((char *)req->resp->etag, "\"%08lx\"", etag);
-		req->resp->etag[10] = '\0';
-		DEBUG_PRINT("Calculated etag: %s\n", req->resp->etag);
-	}
+	evbuffer_add_file(resp->content, fd, 0, resp->content_length);
 
-	save_response_to_cache(srv_info, req);
+	close(fd);
 
-	if (req->resp->content_type != NULL)
-		MHD_add_response_header(req->resp->backend, "Content-Type", (const char *)req->resp->content_type);
-
-	if (req->resp->content_encoding != NULL)
-		MHD_add_response_header(req->resp->backend, "Content-Encoding", (const char *)req->resp->content_encoding);
-
-	if (req->resp->etag != NULL)
-		MHD_add_response_header(req->resp->backend, "ETag", (const char *)req->resp->etag);
-
-	return MHD_queue_response(conn, req->resp->status, req->resp->backend);
+	return resp;
 }

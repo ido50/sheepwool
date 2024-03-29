@@ -1,7 +1,6 @@
-#include <curl/curl.h>
+#include <event2/http.h>
 #include <libconfig.h>
 #include <magic.h>
-#include <microhttpd.h>
 #include <regex.h>
 #include <stdbool.h>
 #include <sys/types.h>
@@ -17,7 +16,6 @@
 
 struct server_info {
 	magic_t magic_db;
-  CURL *curl;
   char **ignore;
   char *html_handler;
 };
@@ -33,24 +31,9 @@ enum resource_type {
   PSGI = 3,
 };
 
-struct resource {
-	char *fullpath;
-  enum resource_type type;
-	off_t size;
-  struct timespec mtime;
-};
-
-struct param {
-  char *name;
+struct header {
+  char *key;
   const char *value;
-  UT_hash_handle hh;
-};
-
-struct body_param {
-  const char *name;
-	enum param_type type;
-	const char *string_value;
-	UT_array *array_value;
   UT_hash_handle hh;
 };
 
@@ -61,55 +44,74 @@ struct header_choice {
 
 #define MAX_ENCODINGS 10
 
-struct response {
-  int status;
-  off_t size;
-  const char *content_encoding;
-  unsigned char *content_type;
-  unsigned char *etag;
-  unsigned char *location;
-  unsigned char *content;
-  struct MHD_Response *backend;
-};
-
 struct request {
+	enum evhttp_cmd_type method;
+  const char *method_str;
   bool is_safe;
-	struct MHD_PostProcessor *postprocessor;
+  struct evhttp_uri *uri;
   const char *host;
-  const char *scheme;
-	const char *version;
-	const char *method;
-	const char *raw_path;
-  CURLU *url;
-  char *dec_path;
-	struct param *headers;
-	struct body_param *body_params;
-	char *remote;
-	struct resource *res;
+  char *path;
+	struct header *headers;
+	char *remote_addr;
+  ev_uint16_t remote_port;
   struct header_choice supported_encodings[MAX_ENCODINGS];
   int num_supported_encodings;
-  struct response *resp;
   const char *delegate;
   int input;
 };
 
-enum MHD_Result try_serving_from_cache(
+struct resource {
+	char *fullpath;
+  enum resource_type type;
+	off_t size;
+  struct timespec mtime;
+};
+
+struct response {
+  int status;
+  char *etag;
+  off_t content_length;
+  const char *content_type;
+  const char *content_encoding;
+  struct evbuffer *content;
+	struct header *extra_headers;
+};
+
+struct response *try_serving_from_cache(
 	struct server_info *srv_info,
-	struct MHD_Connection *conn,
-	struct request *req);
-int save_response_to_cache(struct server_info *srv_info, struct request *req);
+  struct evhttp_request *conn,
+  struct request *req,
+  struct resource *res);
+
+char *save_response_to_cache(struct request *req,
+                           struct resource *res,
+                           struct response *resp,
+                           unsigned char *content);
 
 int start_perl(int argc, char **argv, char **env);
-enum MHD_Result serve_psgi(struct server_info *srv_info, struct MHD_Connection *conn, struct request *req);
 void destroy_perl(void);
 
-enum MHD_Result serve_html(struct server_info *srv_info, struct MHD_Connection *conn, struct request *req);
+struct response *serve_psgi(
+  struct server_info *srv_info,
+  struct evhttp_request *conn,
+  struct request *req,
+  struct resource *res);
 
-bool compress_file(struct server_info *srv_info, struct request *req);
+struct response *serve_html(
+  struct server_info *srv_info,
+  struct evhttp_request *conn,
+  struct request *req,
+  struct resource *res);
 
+struct response *serve_file(struct server_info *srv_info,
+                            struct evhttp_request *conn,
+                            struct request *req,
+                            struct resource *res);
+
+unsigned char *compress_file(
+	struct server_info *srv_info,
+	struct request *req,
+	struct resource *res,
+	struct response *resp);
 bool has_suffix(const char *string, const char *suffix);
 bool is_compressible(const char *mime);
-void parse_accept_encoding(struct request *req);
-enum MHD_Result serve_file(struct server_info *srv_info,
-                                  struct MHD_Connection *conn,
-                                  struct request *req);

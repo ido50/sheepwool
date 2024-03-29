@@ -23,7 +23,9 @@
 #include "config.h"
 
 #include <errno.h>
-#include <microhttpd.h>
+#include <event2/buffer.h>
+#include <event2/http.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,12 +60,42 @@ static char *add_extension(const char *path, const char *ext) {
 	return new_path;
 }
 
-static unsigned char *load_file(
+static char *can_load_file(
 	const char *path,
 	const char *extension,
 	struct timespec orig_mtime,
 	off_t *size) {
-	unsigned char *buffer = NULL;
+	char *fullpath = add_extension(path, extension);
+
+	struct stat fstat;
+	if (lstat(fullpath, &fstat) != 0) {
+		if (errno != ENOENT)
+			fprintf(stderr, "Failed stating file %s: %s\n", fullpath, strerror(errno));
+		return NULL;
+	}
+
+	if (!S_ISREG(fstat.st_mode)) {
+		return NULL;
+	}
+
+	if (fstat.st_mtim.tv_sec < orig_mtime.tv_sec ||
+	    (fstat.st_mtim.tv_sec == orig_mtime.tv_sec &&
+	     fstat.st_mtim.tv_nsec < orig_mtime.tv_nsec)) {
+		// File is older than original, do not return
+		return NULL;
+	}
+
+	*size = fstat.st_size;
+
+	return fullpath;
+}
+
+static char *load_file(
+	const char *path,
+	const char *extension,
+	struct timespec orig_mtime,
+	off_t *size) {
+	char *buffer = NULL;
 	FILE *file = NULL;
 	char *fullpath = add_extension(path, extension);
 
@@ -118,8 +150,10 @@ cleanup:
 	return buffer;
 }
 
-static int save_file(const char *path, const char *extension, unsigned char *buffer, off_t len) {
-	int rc = 1;
+static char *save_file(const char *path,
+                       const char *extension,
+                       unsigned const char *buffer,
+                       off_t len) {
 	FILE *file;
 	char *fullpath = add_extension(path, extension);
 
@@ -130,7 +164,7 @@ static int save_file(const char *path, const char *extension, unsigned char *buf
 	}
 
 	if (len == 0)
-		len = strlen((const char *)buffer);
+		len = strlen((char*)buffer);
 
 	// Write the buffer to the file.
 	size_t written = fwrite(buffer, 1, len, file);
@@ -139,107 +173,99 @@ static int save_file(const char *path, const char *extension, unsigned char *buf
 		goto cleanup;
 	}
 
-	rc = 0;
-
 cleanup:
 	if (file)
 		fclose(file);
-	if (fullpath)
-		free(fullpath);
 
-	return rc;
+	return fullpath;
 }
 
-enum MHD_Result try_serving_from_cache(
+struct response *try_serving_from_cache(
 	struct server_info *srv_info,
-	struct MHD_Connection *conn,
-	struct request *req) {
-	DEBUG_PRINT("Trying to serve %s from cache\n", req->res->fullpath);
+	struct evhttp_request *conn,
+	struct request *req,
+	struct resource *res) {
+	DEBUG_PRINT("Trying to serve %s from cache\n", res->fullpath);
 
 	// Check if we have an ETag file
-	unsigned char *etag = load_file(req->res->fullpath, ".etag", req->res->mtime, NULL);
+	char *etag = load_file(res->fullpath, ".etag", res->mtime, NULL);
 	if (etag == NULL)
-		return MHD_NO;
+		return NULL;
 
 	// Check if there's a mime file
-	unsigned char *content_type = load_file(req->res->fullpath, ".mime", req->res->mtime, NULL);
+	char *content_type = load_file(res->fullpath, ".mime", res->mtime, NULL);
 	if (content_type == NULL)
-		return MHD_NO;
+		return NULL;
 
-	req->resp = malloc(sizeof *req->resp);
-	req->resp->status = MHD_HTTP_OK;
-	req->resp->size = 0;
-	req->resp->etag = etag;
-	req->resp->location = NULL;
-	req->resp->content_type = content_type;
-	req->resp->content = NULL;
-	req->resp->backend = NULL;
-	req->resp->content_encoding = "none";
+	struct response *resp = malloc(sizeof *resp);
+	if (resp == NULL) {
+		fprintf(stderr, "Failed allocating for response: %s\n", strerror(errno));
+		return NULL;
+	}
+
+	resp->status = HTTP_OK;
+	resp->etag = etag;
+	resp->content_length = 0;
+	resp->content_type = content_type;
+	resp->content_encoding = "none";
+	resp->content = NULL;
+	resp->extra_headers = NULL;
 
 	// Go over all supported encodings and check if a cached version exists for
 	// any of them
 	for (int i = 0; i < req->num_supported_encodings - 1; i++) { // -1 because we want to avoid the "none" encoding
-		req->resp->content = load_file(
-			req->res->fullpath, req->supported_encodings[i].value, req->res->mtime, &req->resp->size);
-		if (req->resp->content != NULL) {
-			req->resp->content_encoding = req->supported_encodings[i].value;
-			break;
+		char *fullpath = can_load_file(
+			res->fullpath, req->supported_encodings[i].value, res->mtime, &resp->content_length);
+		if (fullpath) {
+			resp->content = evbuffer_new();
+			if (resp->content == NULL) {
+				fprintf(stderr, "Failed allocating for response buffer: %s\n", strerror(errno));
+				evhttp_send_error(conn, HTTP_INTERNAL, 0);
+				return NULL;
+			}
+
+			evhttp_add_header(evhttp_request_get_output_headers(conn), "Vary", "Accept-Encoding");
+
+			int fd = open(fullpath, O_RDONLY);
+			if (fd == -1) {
+				fprintf(stderr, "Failed opening file %s: %s\n", fullpath, strerror(errno));
+				evhttp_send_error(conn, HTTP_INTERNAL, 0);
+				return NULL;
+			}
+
+			evbuffer_add_file(resp->content, fd, 0, resp->content_length);
+			resp->content_encoding = req->supported_encodings[i].value;
+			free(fullpath);
+
+			DEBUG_PRINT("Request will be served from cache.\n");
+
+			return resp;
 		}
 	}
 
-	if (req->resp->content == NULL)
-		return MHD_NO;
-
-	req->resp->backend = MHD_create_response_from_buffer(
-		req->resp->size, req->resp->content, MHD_RESPMEM_PERSISTENT);
-	if (req->resp->backend == NULL) {
-		fprintf(stderr, "Failed creating response from buffer: %s\n", strerror(errno));
-		return MHD_NO;
-	}
-
-	MHD_add_response_header(req->resp->backend, "ETag", (const char *)req->resp->etag);
-	MHD_add_response_header(req->resp->backend, "Content-Encoding", req->resp->content_encoding);
-	MHD_add_response_header(req->resp->backend, "Content-Type", (const char *)req->resp->content_type);
-
-	enum MHD_Result ret = MHD_queue_response(conn, req->resp->status, req->resp->backend);
-	if (ret == MHD_YES)
-		DEBUG_PRINT("Successfully served %s from cache\n", req->dec_path);
-	return ret;
+	return NULL;
 }
 
-int save_response_to_cache(struct server_info *srv_info, struct request *req) {
-	if (req->resp->content_encoding == NULL || strcmp(req->resp->content_encoding, "none") == 0) {
-		DEBUG_PRINT("Not saving resource %s to cache because we did not compress it\n", req->dec_path);
-		return 0;
-	}
-
-	int rc = 0;
-
+char *save_response_to_cache(struct request *req,
+                             struct resource *res,
+                             struct response *resp,
+                             unsigned char *content) {
 	// Store the ETag
-	if (req->resp->etag != NULL) {
-		rc = save_file(req->res->fullpath, ".etag", req->resp->etag, 0);
-		if (rc)
-			return rc;
+	if (resp->etag != NULL) {
+		char *etag_file = save_file(res->fullpath, ".etag", (unsigned char *)resp->etag, 0);
+		if (etag_file == NULL)
+			return NULL;
+		free(etag_file);
 	}
 
 	// Store the content type
-	if (req->resp->content_type != NULL) {
-		rc = save_file(req->res->fullpath, ".mime", req->resp->content_type, 0);
-		if (rc)
-			return rc;
+	if (resp->content_type != NULL) {
+		char *mime_file = save_file(res->fullpath, ".mime", (unsigned char *)resp->content_type, 0);
+		if (mime_file == NULL)
+			return NULL;
+		free(mime_file);
 	}
 
 	// Store the content
-	if (req->resp->size > 0) {
-		rc = save_file(req->res->fullpath, req->resp->content_encoding, req->resp->content, req->resp->size);
-		if (rc)
-			return rc;
-	}
-
-	if (rc == 0)
-		DEBUG_PRINT("Successfully saved %s to cache", req->dec_path);
-	else
-		DEBUG_PRINT("Failed saving %s to cache", req->dec_path);
-
-	return rc;
+	return save_file(res->fullpath, resp->content_encoding, content, resp->content_length);
 }

@@ -22,8 +22,7 @@
 #define _ISOC99_SOURCE
 #include "config.h"
 #include <errno.h>
-#include <hiredis/hiredis.h>
-#include <pcre.h>
+#include <event2/buffer.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -60,176 +59,204 @@ bool is_compressible(const char *mime) {
 }
 
 #ifdef HAVE_BROTLI
-static int compress_brotli(struct server_info *srv_info, struct request *req) {
-	FILE *file = fopen(req->res->fullpath, "rb");
+static unsigned char *compress_brotli(struct server_info *srv_info,
+                                      struct request *req,
+                                      struct resource *res,
+                                      struct response *resp) {
+	DEBUG_PRINT("Trying to compress %s with brotli", res->fullpath);
+
+	FILE *file = fopen(res->fullpath, "rb");
 	if (!file) {
-		fprintf(stderr, "Failed opening file %s: %s\n", req->res->fullpath, strerror(errno));
-		return 1;
+		fprintf(stderr, "Failed opening file %s: %s\n", res->fullpath, strerror(errno));
+		return NULL;
 	}
 
-	unsigned char *uncompressed = (unsigned char*)malloc(req->res->size);
+	unsigned char *uncompressed = malloc(res->size);
 	if (!uncompressed) {
 		fprintf(stderr, "Memory allocation failed: %s\n", strerror(errno));
 		fclose(file);
-		return 1;
+		return NULL;
 	}
 
-	fread(uncompressed, 1, req->res->size, file);
+	fread(uncompressed, 1, res->size, file);
 	fclose(file);
 
-	size_t buffer_size = BrotliEncoderMaxCompressedSize(req->res->size);
-	req->resp->content = (unsigned char*)malloc(buffer_size);
-	if (!req->resp->content) {
+	size_t buffer_size = BrotliEncoderMaxCompressedSize(res->size);
+	unsigned char *content = malloc(buffer_size);
+	if (content == NULL) {
 		fprintf(stderr, "Failed allocating memory for compressed data: %s\n", strerror(errno));
-		return 1;
+		return NULL;
 	}
 
 	size_t compressed_size;
 	if (!BrotliEncoderCompress(BROTLI_DEFAULT_QUALITY, BROTLI_DEFAULT_WINDOW, BROTLI_DEFAULT_MODE,
-	                           req->res->size, uncompressed, &compressed_size, req->resp->content)) {
+	                           res->size, uncompressed, &compressed_size, content)) {
 
 		fprintf(stderr, "Failed compressing with brotli: %s\n", strerror(errno));
-		return 1;
+		return NULL;
 	}
 
-	req->resp->size = (off_t)compressed_size;
-	req->resp->content_encoding = "br";
+	resp->content_length = compressed_size;
+	resp->content_encoding = "br";
 
-	return 0;
+	return content;
 }
 #endif
 
 #ifdef HAVE_LIBZ
-static int compress_deflate(struct server_info *srv_info, struct request *req) {
-	FILE *file = fopen(req->res->fullpath, "rb");
+static unsigned char *compress_deflate(
+	struct server_info *srv_info,
+	struct request *req,
+	struct resource *res,
+	struct response *resp) {
+	DEBUG_PRINT("Trying to compress %s with deflate", res->fullpath);
+
+	FILE *file = fopen(res->fullpath, "rb");
 	if (!file) {
-		fprintf(stderr, "Failed opening file %s: %s\n", req->res->fullpath, strerror(errno));
-		return 1;
+		fprintf(stderr, "Failed opening file %s: %s\n", res->fullpath, strerror(errno));
+		return NULL;
 	}
 
-	unsigned char *uncompressed = (unsigned char*)malloc(req->res->size);
+	unsigned char *uncompressed = malloc(res->size);
 	if (!uncompressed) {
-		fprintf(stderr, "Memory allocation failed: %s\n", strerror(errno));
+		fprintf(stderr, "Failed allocating for uncompressed data: %s\n", strerror(errno));
 		fclose(file);
-		return 1;
+		return NULL;
 	}
 
-	fread(uncompressed, 1, req->res->size, file);
+	fread(uncompressed, 1, res->size, file);
 	fclose(file);
 
-	unsigned long buffer_size = compressBound(req->res->size);
-	req->resp->content = (unsigned char*)malloc(buffer_size);
-	if (!req->resp->content) {
-		fprintf(stderr, "Memory allocation failed for compressed buffer: %s\n", strerror(errno));
-		free(req->resp->content);
-		req->resp->content = NULL;
-		return 1;
+	unsigned long buffer_size = compressBound(res->size);
+
+	unsigned char *content = malloc(buffer_size);
+	if (content == NULL) {
+		fprintf(stderr, "Memory allocation failed for compressed content: %s\n", strerror(errno));
+		return NULL;
 	}
 
 	// Compress the file content
-	if (compress2(req->resp->content, &buffer_size, uncompressed, req->res->size, Z_BEST_COMPRESSION) != Z_OK) {
-		fprintf(stderr, "Failed compressing %s with deflate: %s\n", req->res->fullpath, strerror(errno));
-		free(req->resp->content);
-		req->resp->content = NULL;
-		return 1;
+	if (compress2(content, &buffer_size, uncompressed, res->size, Z_BEST_COMPRESSION) != Z_OK) {
+		fprintf(stderr, "Failed compressing %s with deflate: %s\n", res->fullpath, strerror(errno));
+		free(content);
+		return NULL;
 	}
 
-	req->resp->size = buffer_size;
-	req->resp->content_encoding = "deflate";
+	resp->content_length = buffer_size;
+	resp->content_encoding = "deflate";
 
-	return 0;
+	return content;
+}
+
+static unsigned char *compress_gzip(
+	struct server_info *srv_info,
+	struct request *req,
+	struct resource *res,
+	struct response *resp) {
+	DEBUG_PRINT("Trying to compress %s with gzip", res->fullpath);
+
+	FILE *file = fopen(res->fullpath, "rb");
+	if (!file) {
+		fprintf(stderr, "Failed opening file %s: %s\n", res->fullpath, strerror(errno));
+		return NULL;
+	}
+
+	unsigned char *uncompressed = malloc(res->size);
+	if (!uncompressed) {
+		fprintf(stderr, "Failed allocating for uncompressed data: %s\n", strerror(errno));
+		fclose(file);
+		return NULL;
+	}
+
+	fread(uncompressed, 1, res->size, file);
+	fclose(file);
+
+	unsigned long compressed_size = compressBound(res->size) + 18; // Add 18 bytes for the gzip header and trailer
+	unsigned char *compressed = malloc(compressed_size);
+	if (!compressed) {
+		fprintf(stderr, "Failed allocating for compressed data: %s\n", strerror(errno));
+		return NULL;
+	}
+
+	z_stream stream;
+	stream.zalloc = Z_NULL;
+	stream.zfree = Z_NULL;
+	stream.opaque = Z_NULL;
+	stream.avail_in = res->size;
+	stream.next_in = uncompressed;
+	stream.avail_out = compressed_size;
+	stream.next_out = compressed;
+
+	// Initialize gzip encoding
+	if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+		fprintf(stderr, "Failed initializing deflate stream: %s\n", stream.msg);
+		free(uncompressed);
+		free(compressed);
+		return NULL;
+	}
+
+	// Compress the file
+	if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
+		fprintf(stderr, "Failed compressing %s with gzip: %s\n", res->fullpath, stream.msg);
+		deflateEnd(&stream);
+		free(uncompressed);
+		free(compressed);
+		return NULL;
+	}
+
+	compressed_size = stream.total_out;
+
+	if (deflateEnd(&stream) != Z_OK) {
+		fprintf(stderr, "Failed compressing %s with gzip: %s\n", res->fullpath, stream.msg);
+		free(uncompressed);
+		free(compressed);
+		return NULL;
+	}
+
+	free(uncompressed);
+
+	resp->content_length = compressed_size;
+	resp->content_encoding = "gzip";
+
+	return compressed;
 }
 #endif
 
-static int compare_encodings(const void* a, const void* b) {
-	double weight_a = ((struct header_choice*)a)->weight;
-	double weight_b = ((struct header_choice*)b)->weight;
-	return (weight_a < weight_b) - (weight_a > weight_b);
-}
-
-void parse_accept_encoding(struct request *req) {
-	const char *error;
-	int erroffset;
-	pcre *re = NULL;
-	int ovector[MAX_ENCODINGS+1];
-	const char* pattern = "([^,;\\s]+)\\s*(?:;\\s*q=([01]\\.\\d{0,3}|1\\.0{0,3}|0))?";
-
-	struct param *param;
-	HASH_FIND_STR(req->headers, "accept-encoding", param);
-
-	if (
-		param == NULL ||
-		param->value == NULL ||
-		strcmp(param->value, "") == 0) {
-
-		DEBUG_PRINT("Client does not accept any encoding\n");
-		goto cleanup;
-	}
-
-	DEBUG_PRINT("Accept-Encoding sent by client: %s\n", param->value);
-
-	// Compile the regex pattern
-	re = pcre_compile(pattern, 0, &error, &erroffset, NULL);
-	if (re == NULL) {
-		fprintf(stderr, "PCRE compilation failed at offset %d: %s\n", erroffset, error);
-		goto cleanup;
-	}
-
-	const char* subject = param->value;
-	int subject_length = strlen(subject);
-	int start_offset = 0;
-
-	int rc;
-	while ((rc = pcre_exec(re, NULL, subject, subject_length, start_offset, 0, ovector, MAX_ENCODINGS)) >= 0) {
-		for (int i = 1; i < rc; i++) {
-			const char *match;
-			pcre_get_substring(subject, ovector, rc, i, &match);
-			if (i == 1) {
-				req->supported_encodings[req->num_supported_encodings].value = match;
-			} else if (i == 2 && match != NULL) { // Weight, if present
-				req->supported_encodings[req->num_supported_encodings].weight = strtod(match, NULL);
-			}
-		}
-
-		start_offset = ovector[1]; // Move past the end of the previous match
-		req->num_supported_encodings++;
-	}
-
-	qsort(req->supported_encodings, req->num_supported_encodings, sizeof(struct header_choice), compare_encodings);
-
-cleanup:
-	req->supported_encodings[req->num_supported_encodings].value = "none";
-	req->supported_encodings[req->num_supported_encodings++].weight = 0;
-
-	if (re != NULL) {
-		/*for (int i = 0; i < req->num_supported_encodings - 1; i++)*/
-		/*pcre_free_substring(req->supported_encodings[i].value);*/
-		pcre_free(re);
-	}
-}
-
-bool compress_file(struct server_info *srv_info, struct request *req) {
+unsigned char *compress_file(struct server_info *srv_info,
+                             struct request *req,
+                             struct resource *res,
+                             struct response *resp) {
 	for (int i = 0; i < req->num_supported_encodings - 1; i++) {
+		DEBUG_PRINT("Client accepts %s\n", req->supported_encodings[i].value);
+
 #ifdef HAVE_BROTLI
 		if (strcmp(req->supported_encodings[i].value, "br") == 0) {
-			int rc = compress_brotli(srv_info, req);
-			if (rc)
+			unsigned char *content = compress_brotli(srv_info, req, res, resp);
+			if (content == NULL)
 				continue;
-			DEBUG_PRINT("Compressed with brotli to %lo bytes\n", req->resp->size);
-			return true;
+			DEBUG_PRINT("Compressed with brotli to %lo bytes\n", resp->content_length);
+			return content;
 		}
 #endif
 
 #ifdef HAVE_LIBZ
-		if (strcmp(req->supported_encodings[i].value, "deflate") == 0) {
-			int rc = compress_deflate(srv_info, req);
-			if (rc)
+		if (strcmp(req->supported_encodings[i].value, "gzip") == 0) {
+			unsigned char *content = compress_gzip(srv_info, req, res, resp);
+			if (content == NULL)
 				continue;
-			DEBUG_PRINT("Compressed with deflate to %lo bytes\n", req->resp->size);
-			return true;
+			DEBUG_PRINT("Compressed with gzip to %lo bytes\n", resp->content_length);
+			return content;
+		}
+
+		if (strcmp(req->supported_encodings[i].value, "deflate") == 0) {
+			unsigned char *content = compress_deflate(srv_info, req, res, resp);
+			if (content == NULL)
+				continue;
+			DEBUG_PRINT("Compressed with deflate to %lo bytes\n", resp->content_length);
+			return content;
 		}
 #endif
 	}
 
-	return false;
+	return NULL;
 }

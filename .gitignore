@@ -11,7 +11,8 @@ stamp-h1
 vgcore*
 Makefile*
 !Makefile.am
-vendor
+vendor/*
+!vendor/README.md
 .deps
 src/cmdline.h
 src/cmdline.c

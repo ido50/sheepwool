@@ -24,15 +24,18 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
-#include <curl/curl.h>
 #include <errno.h>
 #include <error.h>
+#include <event2/buffer.h>
+#include <event2/event.h>
+#include <event2/http.h>
+#include <event2/keyvalq_struct.h>
 #include <fcntl.h>
 #include <libconfig.h>
 #include <libgen.h>
 #include <magic.h>
-#include <microhttpd.h>
 #include <netinet/in.h>
+#include <pcre.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -56,63 +59,53 @@ extern int unveil(const char *path, const char *permissions);
 
 static size_t max_date_size = strlen("18/Sep/2011:19:18:28 -0400") + 6;
 
-void request_completed(void *cls, struct MHD_Connection *connection,
-                       void **con_cls, enum MHD_RequestTerminationCode toe) {
-	if (*con_cls == NULL)
-		return;
+struct all_structs {
+	struct request *req;
+	struct resource *res;
+	struct response *resp;
+};
 
-	struct request *req = *con_cls;
+static void free_request(struct evhttp_request *conn, void *arg) {
+	struct all_structs *structs = arg;
 
-	if (req->dec_path != NULL)
-		curl_free(req->dec_path);
+	if (structs->req != NULL) {
+		if (structs->req->uri != NULL)
+			evhttp_uri_free(structs->req->uri);
 
-	if (req->url != NULL)
-		curl_url_cleanup(req->url);
+		if (structs->req->path != NULL)
+			free(structs->req->path);
 
-	if (req->remote != NULL)
-		free(req->remote);
+		if (structs->req->headers != NULL) {
+			struct header *current_header, *tmp;
 
-	if (req->headers != NULL) {
-		struct param *current_header, *tmp;
-
-		HASH_ITER(hh, req->headers, current_header, tmp) {
-			HASH_DEL(req->headers, current_header);
-			free(current_header);
+			HASH_ITER(hh, structs->req->headers, current_header, tmp) {
+				HASH_DEL(structs->req->headers, current_header);
+				free(current_header);
+			}
 		}
+
+		if (structs->req->num_supported_encodings)
+			for (int i = 0; i < structs->req->num_supported_encodings - 1; i++)
+				pcre_free_substring(structs->req->supported_encodings[i].value);
+
+		free(structs->req);
 	}
 
-	if (req->postprocessor != NULL)
-		MHD_destroy_post_processor(req->postprocessor);
-
-	if (req->body_params != NULL) {
-		struct body_param *current_param, *tmp;
-
-		HASH_ITER(hh, req->body_params, current_param, tmp) {
-			HASH_DEL(req->body_params, current_param);
-			if (current_param->type == ARRAY)
-				utarray_free(current_param->array_value);
-			free(current_param);
-		}
+	if (structs->res != NULL) {
+		if (structs->res->fullpath != NULL)
+			free(structs->res->fullpath);
+		free(structs->res);
 	}
 
-	if (req->res != NULL) {
-		free(req->res->fullpath);
-		free(req->res);
+	if (structs->resp != NULL) {
+		if (structs->resp->etag != NULL)
+			free(structs->resp->etag);
+		if (structs->resp->content != NULL)
+			evbuffer_free(structs->resp->content);
+		free(structs->resp);
 	}
 
-	if (req->resp != NULL) {
-		if (req->resp->backend != NULL)
-			MHD_destroy_response(req->resp->backend);
-		if (req->resp->content_type != NULL)
-			free(req->resp->content_type);
-		if (req->resp->content != NULL)
-			free(req->resp->content);
-		free(req->resp);
-	}
-
-	free(req);
-
-	*con_cls = NULL;
+	free(structs);
 }
 
 bool has_suffix(const char *string, const char *suffix) {
@@ -127,79 +120,67 @@ bool has_suffix(const char *string, const char *suffix) {
 	return strncmp(string + string_len - suffix_len, suffix, suffix_len) == 0;
 }
 
-static enum MHD_Result collect_param(void *coninfo_cls, enum MHD_ValueKind kind,
-                                     const char *key, const char *value) {
-	struct request *req = coninfo_cls;
+static char *get_fullpath(struct request *req) {
+	int len_prefix = 2; // length of ./ prefix
+	int len_path = strlen(req->path);
+	int len = len_prefix + len_path + 1; // 1 for NULL terminator
 
-	struct body_param *param = NULL;
-	HASH_FIND_STR(req->body_params, key, param);
+	// if path has a trailing slash, remove it
+	if (len_path > 1 && req->path[len_path - 1] == '/')
+		len -= 1;
 
-	if (param == NULL) {
-		// new string parameter
-		param = malloc(sizeof *param);
-		param->name = key;
-		param->string_value = value;
-		param->type = STRING;
-		HASH_ADD_STR(req->body_params, name, param);
-		return MHD_YES;
+	char *fullpath = NULL;
+
+	if (true) {
+		// remove heading slash
+		char *path = req->path;
+		if (path[0] == '/') {
+			len -= 1;
+			path = path + 1;
+		}
+
+		fullpath = malloc(len);
+		if (fullpath == NULL) {
+			fprintf(stderr, "Failed allocating %d bytes for fullpath: %s\n", len, strerror(errno));
+			return NULL;
+		}
+
+		stpcpy(stpcpy(fullpath, "./"), path);
+
+		return fullpath;
 	}
 
-	if (param->type == ARRAY) {
-		// Push to an existing array
-		utarray_push_back(param->array_value, value);
-	} else {
-		// Turn existing string into an array and push new value
-		param->type = ARRAY;
-		utarray_new(param->array_value, &ut_str_icd);
-		utarray_push_back(param->array_value, param->string_value);
-		utarray_push_back(param->array_value, value);
+	// account for the host
+	len += strlen(req->host);
+
+	// we need a heading slash when we have a host
+	if (req->path[0] != '/')
+		len++;
+
+	fullpath = malloc(len);
+	if (fullpath == NULL) {
+		fprintf(stderr, "Failed allocating %d bytes for fullpath: %s\n", len, strerror(errno));
+		return NULL;
 	}
 
-	return MHD_YES;
-}
+	char *p = stpcpy(fullpath, "./");
+	p = stpcpy(p, req->host);
+	if (req->path[0] != '/')
+		p = stpcpy(p, "/");
+	stpcpy(p, req->path);
 
-static enum MHD_Result build_qs(void *coninfo_cls, enum MHD_ValueKind kind,
-                                const char *key, const char *value) {
-	struct request *req = coninfo_cls;
-
-	size_t part_len = strlen(key)+1+strlen(value)+1;
-	char part[part_len];
-	snprintf(part, part_len, "%s=%s", key, value);
-	curl_url_set(req->url, CURLUPART_QUERY, part, CURLU_APPENDQUERY);
-
-	return MHD_YES;
-}
-
-static enum MHD_Result iterate_post(void *coninfo_cls, enum MHD_ValueKind kind,
-                                    const char *key, const char *filename,
-                                    const char *content_type, const char *transfer_encoding,
-                                    const char *value, uint64_t off, size_t size) {
-	if (kind == MHD_POSTDATA_KIND)
-		return collect_param(coninfo_cls, kind, key, value);
-
-	return MHD_YES;
-}
-
-static enum MHD_Result parse_header(void *cls, enum MHD_ValueKind kind, const char *key,
-                                    const char *value) {
-	struct request *req = cls;
-	int len = strlen(key);
-
-	char *header_name = malloc(len+1);
-	for (int i = 0; i <= len-1; i++)
-		header_name[i] = tolower(key[i]);
-	header_name[len] = '\0';
-
-	struct param *header = malloc(sizeof *header);
-	header->name = header_name;
-	header->value = value;
-
-	HASH_ADD_STR(req->headers, name, header);
-
-	return MHD_YES;
+	return fullpath;
 }
 
 static struct resource *locate_resource_in_fs(struct request *req, char *fullpath, bool exact) {
+	if (fullpath == NULL) {
+		fullpath = get_fullpath(req);
+		if (fullpath == NULL) {
+			DEBUG_PRINT("Full path is NULL\n");
+			return NULL;
+		}
+	}
+
 	DEBUG_PRINT("Looking for %s, exact=%d\n", fullpath, exact);
 
 	struct stat fstat;
@@ -279,56 +260,7 @@ static struct resource *locate_resource_in_fs(struct request *req, char *fullpat
 	return NULL;
 }
 
-static char *get_fullpath(struct request *req, const char *path) {
-	int len_prefix = 2; // length of ./ prefix
-	int len_path = strlen(path);
-	int len = len_prefix + len_path + 1; // 1 for NULL terminator
-
-	// if path has a trailing slash, remove it
-	if (len_path > 1 && path[len_path - 1] == '/')
-		len -= 1;
-
-	char *fullpath = NULL;
-
-	if (true) {
-		// remove heading slash
-		if (path[0] == '/') {
-			len -= 1;
-			path = path + 1;
-		}
-
-		fullpath = malloc(len);
-		if (fullpath == NULL)
-			return NULL;
-
-		stpcpy(stpcpy(fullpath, "./"), path);
-
-		return fullpath;
-	}
-
-	// account for the host
-	len += strlen(req->host);
-
-	// we need a heading slash when we have a host
-	if (path[0] != '/')
-		len++;
-
-	fullpath = malloc(len);
-	if (fullpath == NULL)
-		return NULL;
-
-	char *p = stpcpy(fullpath, "./");
-	p = stpcpy(p, req->host);
-	if (path[0] != '/')
-		p = stpcpy(p, "/");
-	stpcpy(p, path);
-
-	return fullpath;
-}
-
-static void write_access_log(const char *method, const char *path,
-                             const char *version, struct request *req,
-                             enum MHD_Result ret) {
+static void write_access_log(struct request *req, struct response *resp) {
 	char date[max_date_size];
 	time_t now = time(NULL);
 	if (now != -1) {
@@ -338,15 +270,15 @@ static void write_access_log(const char *method, const char *path,
 		snprintf(date, max_date_size, "unknown");
 	}
 
-	const char *remote = req->remote;
+	const char *remote = req->remote_addr;
 	if (remote == NULL)
 		remote = "-";
 
-	struct param *refererp = NULL;
+	struct header *refererp = NULL;
 	HASH_FIND_STR(req->headers, "referer", refererp);
 	const char *referer = refererp ? refererp->value : "";
 
-	struct param *agentp = NULL;
+	struct header *agentp = NULL;
 	HASH_FIND_STR(req->headers, "user-agent", agentp);
 	const char *user_agent = agentp ? agentp->value : "";
 
@@ -354,190 +286,279 @@ static void write_access_log(const char *method, const char *path,
 	        req->host,
 	        remote,
 	        date,
-	        method,
-	        path,
-	        version,
-	        req->resp->status,
-	        req->resp->size,
+	        req->method_str,
+	        req->path,
+	        "HTTP/1.1",
+	        resp->status,
+	        resp->content_length,
 	        referer,
 	        user_agent);
 }
 
-static bool request_is_safe(const char *method) {
-	return strcmp(method, "GET") == 0 ||
-	       strcmp(method, "HEAD") == 0 ||
-	       strcmp(method, "OPTIONS") == 0;
+static int compare_encodings(const void *a, const void *b) {
+	double weight_a = ((struct header_choice*)a)->weight;
+	double weight_b = ((struct header_choice*)b)->weight;
+	return (weight_a < weight_b) - (weight_a > weight_b);
 }
 
-static enum MHD_Result init_request(void **con_cls, void *cls,
-                                    struct MHD_Connection *conn, const char *path,
-                                    const char *method, const char *version,
-                                    const char *upload_data, size_t *upload_data_size) {
-	struct server_info *srv_info = cls;
+static void parse_accept_encoding(struct request *req) {
+	const char *error;
+	int erroffset;
+	pcre *re = NULL;
+	int ovector[MAX_ENCODINGS+1];
+	const char* pattern = "([^,;\\s]+)\\s*(?:;\\s*q=([01]\\.\\d{0,3}|1\\.0{0,3}|0))?";
 
+	struct header *param;
+	HASH_FIND_STR(req->headers, "accept-encoding", param);
+
+	if (
+		param == NULL ||
+		param->value == NULL ||
+		strcmp(param->value, "") == 0) {
+
+		DEBUG_PRINT("Client does not accept any encoding\n");
+		goto cleanup;
+	}
+
+	DEBUG_PRINT("Accept-Encoding sent by client: %s\n", param->value);
+
+	// Compile the regex pattern
+	re = pcre_compile(pattern, 0, &error, &erroffset, NULL);
+	if (re == NULL) {
+		fprintf(stderr, "PCRE compilation failed at offset %d: %s\n", erroffset, error);
+		goto cleanup;
+	}
+
+	const char *subject = param->value;
+	int subject_length = strlen(subject);
+	int start_offset = 0;
+
+	int rc;
+	while ((rc = pcre_exec(re, NULL, subject, subject_length, start_offset, 0, ovector, MAX_ENCODINGS)) >= 0) {
+		for (int i = 1; i < rc; i++) {
+			const char *match;
+			pcre_get_substring(subject, ovector, rc, i, &match);
+			if (i == 1) {
+				req->supported_encodings[req->num_supported_encodings].value = match;
+			} else if (i == 2 && match != NULL) { // Weight, if present
+				req->supported_encodings[req->num_supported_encodings].weight = strtod(match, NULL);
+			}
+		}
+
+		start_offset = ovector[1]; // Move past the end of the previous match
+		req->num_supported_encodings++;
+	}
+
+	qsort(req->supported_encodings, req->num_supported_encodings, sizeof(struct header_choice), compare_encodings);
+
+cleanup:
+	req->supported_encodings[req->num_supported_encodings].value = "none";
+	req->supported_encodings[req->num_supported_encodings++].weight = 0;
+
+	if (re != NULL) {
+		pcre_free(re);
+	}
+}
+
+static struct request *init_request(struct evhttp_request *conn) {
 	struct request *req = malloc(sizeof *req);
 	if (req == NULL) {
-		DEBUG_PRINT("Failed allocating request: %s\n", strerror(errno));
-		return MHD_NO;
+		fprintf(stderr, "Failed allocating for request: %s\n", strerror(errno));
+		return NULL;
 	}
 
-	req->is_safe = strcmp(method, "GET") == 0
-	               || strcmp(method, "HEAD") == 0
-	               || strcmp(method, "OPTIONS") == 0;
-	req->version = version;
-	req->method = method;
-	req->url = curl_url();
-	req->raw_path = path;
-	req->dec_path = NULL;
-	req->remote = NULL;
-	req->postprocessor = NULL;
+	req->uri = NULL;
+	req->path = NULL;
+
+	// Decode the URI
+	req->uri = evhttp_uri_parse(evhttp_request_get_uri(conn));
+	if (!req->uri)
+		return NULL;
+
+	req->host = evhttp_request_get_host(conn);
+
+	const char *raw_path = evhttp_uri_get_path(req->uri);
+	if (!raw_path)
+		raw_path = "/";
+
+	req->path = evhttp_uridecode(raw_path, 0, NULL);
+	if (req->path == NULL)
+		return NULL;
+
+	req->method = evhttp_request_get_command(conn);
+
+	switch (req->method) {
+	case EVHTTP_REQ_GET:
+		req->method_str = "GET";
+		break;
+	case EVHTTP_REQ_PUT:
+		req->method_str = "PUT";
+		break;
+	case EVHTTP_REQ_POST:
+		req->method_str = "POST";
+		break;
+	case EVHTTP_REQ_PATCH:
+		req->method_str = "PATCH";
+		break;
+	case EVHTTP_REQ_DELETE:
+		req->method_str = "DELETE";
+		break;
+	case EVHTTP_REQ_OPTIONS:
+		req->method_str = "OPTIONS";
+		break;
+	case EVHTTP_REQ_HEAD:
+		req->method_str = "HEAD";
+		break;
+	case EVHTTP_REQ_TRACE:
+		req->method_str = "TRACE";
+		break;
+	case EVHTTP_REQ_CONNECT:
+		req->method_str = "CONNECT";
+		break;
+	}
+
+	req->is_safe = req->method == EVHTTP_REQ_GET ||
+	               req->method == EVHTTP_REQ_HEAD ||
+	               req->method == EVHTTP_REQ_OPTIONS;
+
+	evhttp_connection_get_peer(evhttp_request_get_connection(conn), &req->remote_addr, &req->remote_port);
+
 	req->headers = NULL;
-	req->body_params = NULL;
 	req->delegate = NULL;
 	req->input = 0;
+
 	req->num_supported_encodings = 0;
 	memset(req->supported_encodings, 0, sizeof(req->supported_encodings));
-	req->res = NULL;
-	req->resp = NULL;
-
-	*con_cls = (void*)req;
 
 	// Parse request headers
-	MHD_get_connection_values(conn, MHD_HEADER_KIND, &parse_header, req);
-
-	// Is this a localhost request?
-	struct param *hostp = NULL;
-	HASH_FIND_STR(req->headers, "host", hostp);
-	if (hostp)
-		req->host = hostp->value;
-
-	// Parse scheme and remote client
-	const union MHD_ConnectionInfo *info = MHD_get_connection_info(conn, MHD_CONNECTION_INFO_PROTOCOL|MHD_CONNECTION_INFO_CLIENT_ADDRESS);
-	req->scheme = "http";
-	if (info != NULL) {
-		if (info->protocol) {
-			req->scheme = "https";
+	struct evkeyvalq *headers = evhttp_request_get_input_headers(conn);
+	struct evkeyval *kv = headers->tqh_first;
+	while (kv) {
+		struct header *h = malloc(sizeof *h);
+		if (h == NULL) {
+			fprintf(stderr, "Failed allocating for input header: %s\n", strerror(errno));
+			return NULL;
 		}
-		if (info->client_addr->sa_family == AF_INET) {
-			struct sockaddr_in *in = (struct sockaddr_in *)info->client_addr;
-			req->remote = strdup(inet_ntoa(in->sin_addr));
-		}
-	}
 
-	// Parse the request path, constructing a full URL, an unescaped path and a
-	// query string
-	size_t urlen = strlen(req->scheme) + 3 + strlen(req->host) + strlen(req->raw_path);
-	char url[urlen+1];
-	snprintf(url, urlen+1, "%s://%s%s", req->scheme, req->host, req->raw_path);
+		int key_len = strlen(kv->key);
 
-	CURLUcode rc = curl_url_set(req->url, CURLUPART_URL, url, 0);
-	if (rc != CURLE_OK) {
-		fprintf(stderr, "Failed parsing request URL %s: %s\n", url, curl_url_strerror(rc));
-		return MHD_NO;
-	}
+		for (int i = 0; i < key_len; i++)
+			kv->key[i] = tolower(kv->key[i]);
 
-	MHD_get_connection_values(conn, MHD_GET_ARGUMENT_KIND, &build_qs, req);
+		h->key = kv->key;
+		h->value = kv->value;
 
-	rc = curl_url_get(req->url, CURLUPART_PATH, &req->dec_path, CURLU_URLENCODE);
-	if (rc != CURLE_OK) {
-		req->dec_path = strdup(path);
-	}
+		HASH_ADD_STR(req->headers, key, h);
 
-	// Locate the requested resource in the file system
-	char *fullpath = get_fullpath(req, req->dec_path);
-
-	if (fullpath == NULL) {
-		DEBUG_PRINT("Full path is NULL\n");
-		return MHD_NO;
-	}
-
-	DEBUG_PRINT("Full path is %s\n", fullpath);
-
-	req->res = locate_resource_in_fs(req, fullpath, false);
-	if (req->res == NULL) {
-		DEBUG_PRINT("Resource is NULL\n");
-		return MHD_NO;
-	}
-
-	DEBUG_PRINT("File path is %s\n", req->res->fullpath);
-
-	if (req->res->type != PSGI && !request_is_safe(method)) {
-		// TODO: need to returned Method Not Allowed
-		return MHD_NO;
+		kv = kv->next.tqe_next;
 	}
 
 	// Parse the Accept-Encoding header so we know which compression algorithms
 	// the client supports
 	parse_accept_encoding(req);
 
-	if (method[0] == 'P') {
-		struct param *ct = NULL;
-		HASH_FIND_STR(req->headers, "content-type", ct);
-		if (ct != NULL) {
-			req->postprocessor = MHD_create_post_processor(
-				conn, 65536, &iterate_post, (void *)&req);
-
-			if (req->postprocessor == NULL) {
-				DEBUG_PRINT("POST processor is NULL\n");
-				return MHD_NO;
-			}
-		}
-	}
-
-	return MHD_YES;
+	return req;
 }
 
-enum MHD_Result handle_req(void *cls, struct MHD_Connection *conn, const char *path,
-                           const char *method, const char *version,
-                           const char *upload_data, size_t *upload_data_size,
-                           void **con_cls) {
-	struct server_info *srv_info = cls;
+static void handle_req(struct evhttp_request *conn, void *arg) {
+	struct server_info *srv_info = arg;
+	struct request *req = NULL;
+	struct resource *res = NULL;
+	struct response *resp = NULL;
 
-	if (*con_cls == NULL)
-		return init_request(con_cls, cls, conn, path, method, version, upload_data, upload_data_size);
+	struct all_structs *structs = malloc(sizeof *structs);
+	if (structs == NULL) {
+		fprintf(stderr, "Failed allocating for structs: %s\n", strerror(errno));
+		evhttp_send_error(conn, HTTP_INTERNAL, 0);
+		return;
+	}
 
-	struct request *req = *con_cls;
-	int ret = MHD_NO;
+	structs->req = req;
+	structs->res = res;
+	structs->resp = resp;
 
-	// If request is unsafe (i.e. not GET/HEAD/etc.) and has a POST processor,
-	// execute it
-	if (!req->is_safe && req->postprocessor != NULL && *upload_data_size != 0) {
-		// upload not yet done
-		if (MHD_post_process(req->postprocessor, upload_data, *upload_data_size) != MHD_YES) {
-			DEBUG_PRINT("POST processing failed\n");
-			return MHD_NO;
-		}
+	evhttp_request_set_on_complete_cb(conn, free_request, structs);
 
-		*upload_data_size = 0;
+	req = init_request(conn);
+	if (req == NULL) {
+		evhttp_send_error(conn, HTTP_INTERNAL, 0);
+		return;
+	}
 
-		return MHD_YES;
+	structs->req = req;
+
+	if (strstr(req->path, "..")) {
+		evhttp_send_error(conn, HTTP_BADREQUEST, 0);
+		return;
+	}
+
+	res = locate_resource_in_fs(req, NULL, false);
+	if (res == NULL) {
+		evhttp_send_error(conn, HTTP_NOTFOUND, 0);
+		return;
+	}
+
+	structs->res = res;
+
+	if (!req->is_safe && res->type != PSGI) {
+		evhttp_send_error(conn, HTTP_BADMETHOD, 0);
+		return;
 	}
 
 	// If request is safe, try serving it from cache.
-	if (req->is_safe) {
-		ret = try_serving_from_cache(srv_info, conn, req);
-		if (ret == MHD_YES)
-			goto cleanup;
-	}
+	if (req->method == EVHTTP_REQ_GET || req->method == EVHTTP_REQ_HEAD)
+		resp = try_serving_from_cache(srv_info, conn, req, res);
 
 	// Serving from cache failed, let's serve the file based on its type.
-	switch (req->res->type) {
-	case PSGI:
-		ret = serve_psgi(srv_info, conn, req);
-		break;
-	case HTML:
-		ret = serve_html(srv_info, conn, req);
-		break;
-	default:
-		ret = serve_file(srv_info, conn, req);
+	if (!resp) {
+		switch (res->type) {
+		case PSGI:
+			resp = serve_psgi(srv_info, conn, req, res);
+			break;
+		case HTML:
+			resp = serve_html(srv_info, conn, req, res);
+			break;
+		default:
+			resp = serve_file(srv_info, conn, req, res);
+		}
 	}
 
-cleanup:
-	write_access_log(method, path, version, req, ret);
+	if (!resp) {
+		evhttp_send_error(conn, HTTP_INTERNAL, 0);
+		return;
+	}
 
-	return ret;
+	structs->resp = resp;
+
+	struct evkeyvalq *headers = evhttp_request_get_output_headers(conn);
+
+	if (resp->content_length) {
+		char content_length[21];
+		snprintf(content_length, 21, "%ld", resp->content_length);
+		evhttp_add_header(headers, "Content-Length", content_length);
+		evhttp_add_header(headers, "Content-Type", resp->content_type);
+	}
+
+	if (resp->content_encoding && strcmp(resp->content_encoding, "none") != 0)
+		evhttp_add_header(headers, "Content-Encoding", resp->content_encoding);
+
+	if (resp->etag)
+		evhttp_add_header(headers, "ETag", resp->etag);
+
+	if (resp->extra_headers) {
+		struct header *current_header, *tmp;
+		HASH_ITER(hh, resp->extra_headers, current_header, tmp) {
+			evhttp_add_header(headers, current_header->key, current_header->value);
+		}
+	}
+
+	if (req->method == EVHTTP_REQ_HEAD && resp->content != NULL)
+		evbuffer_drain(resp->content, evbuffer_get_length(resp->content));
+
+	evhttp_send_reply(conn, resp->status, "OK", resp->content);
+
+	write_access_log(req, resp);
 }
-
 
 static int sandbox(char *root) {
 	int rc = 0;
@@ -652,20 +673,19 @@ static char *get_root_directory(struct gengetopt_args_info *params) {
 	return root;
 }
 
-static volatile sig_atomic_t keep_running = 1;
-
-static void sig_handler(int _) {
-	(void)_;
-	keep_running = 0;
+static void signal_cb(evutil_socket_t fd, short event, void *arg)
+{
+	printf("%s signal received\n", strsignal(fd));
+	event_base_loopbreak(arg);
 }
 
 int main(int argc, char **argv, char **env) {
-	signal(SIGINT, sig_handler);
-
 	struct server_info srv_info;
 	srv_info.html_handler = NULL;
 
-	struct MHD_Daemon *daemon;
+	struct event_base *base;
+	struct evhttp *http_server;
+	struct event *sig_int;
 
 	// Parse command line arguments
 	struct gengetopt_args_info params;
@@ -696,64 +716,31 @@ int main(int argc, char **argv, char **env) {
 	if (rc)
 		goto cleanup;
 
-	rc = curl_global_init(CURL_GLOBAL_DEFAULT);
-	if (rc) {
-		fprintf(stderr, "Failed initializing libcurl\n");
-		goto cleanup;
-	}
-
-	srv_info.curl = curl_easy_init();
-	if (srv_info.curl == NULL) {
-		rc = 1;
-		fprintf(stderr, "Failed initializing libcurl's easy interface\n");
-		goto cleanup;
-	}
-
 	// Load configuration
 	load_config(&srv_info);
 
 	// Start the HTTP server
-	unsigned int mhd_flags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG;
-	if (MHD_is_feature_supported(MHD_FEATURE_EPOLL))
-		mhd_flags |= MHD_USE_EPOLL;
-	else if (MHD_is_feature_supported(MHD_FEATURE_POLL))
-		mhd_flags |= MHD_USE_POLL;
-#ifdef DEBUG
-	mhd_flags |= MHD_USE_DEBUG;
-	long int thread_pool_size = 1;
-#else
-	long int thread_pool_size = sysconf(_SC_NPROCESSORS_ONLN);
-#endif
-
 	DEBUG_PRINT("Starting HTTP server...\n");
 
-	daemon = MHD_start_daemon(
-		mhd_flags, params.port_arg,
-		NULL, NULL, &handle_req, &srv_info,
-		MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL,
-		MHD_OPTION_CONNECTION_TIMEOUT, 1800, NULL,
-		MHD_OPTION_PER_IP_CONNECTION_LIMIT, 10, NULL,
-		MHD_OPTION_THREAD_POOL_SIZE, thread_pool_size, NULL,
-		MHD_OPTION_END);
-	if (daemon == NULL) {
-		rc = 1;
-		goto cleanup;
-	}
+	base = event_base_new();
+	http_server = evhttp_new(base);
+	evhttp_set_allowed_methods(http_server, EVHTTP_REQ_GET|EVHTTP_REQ_POST|EVHTTP_REQ_HEAD|EVHTTP_REQ_PUT|EVHTTP_REQ_DELETE|EVHTTP_REQ_OPTIONS|EVHTTP_REQ_PATCH);
+	evhttp_bind_socket(http_server, "0.0.0.0", params.port_arg);
+	evhttp_set_gencb(http_server, handle_req, &srv_info);
 
-	DEBUG_PRINT("Server is listening on 0.0.0.0:%d\n", params.port_arg);
+	sig_int = evsignal_new(base, SIGINT, signal_cb, base);
+	event_add(sig_int, NULL);
 
-	while (keep_running)
-		(void)0;
+	fprintf(stderr, "Listening for requests on http://0.0.0.0:%d\n", params.port_arg);
+
+	event_base_dispatch(base);
 
 cleanup:
-	if (daemon != NULL) {
-		fprintf(stderr, "Shutting down server\n");
-		MHD_stop_daemon(daemon);
-	}
+	fprintf(stderr, "Shutting down server...\n");
 
-	if (srv_info.curl != NULL)
-		curl_easy_init();
-	curl_global_cleanup();
+	evhttp_free(http_server);
+	event_free(sig_int);
+	event_base_free(base);
 
 	if (srv_info.magic_db != NULL)
 		magic_close(srv_info.magic_db);
