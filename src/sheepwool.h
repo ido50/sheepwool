@@ -1,12 +1,9 @@
 #include <event2/http.h>
 #include <libconfig.h>
 #include <magic.h>
-#include <regex.h>
 #include <stdbool.h>
 #include <sys/types.h>
 #include <time.h>
-#include <utarray.h>
-#include <uthash.h>
 
 #ifdef DEBUG
 #define DEBUG_PRINT(fmt, args ...)    fprintf(stderr, fmt, ## args)
@@ -31,12 +28,6 @@ enum resource_type {
   PSGI = 3,
 };
 
-struct header {
-  char *key;
-  const char *value;
-  UT_hash_handle hh;
-};
-
 struct header_choice {
   const char *value;
   double weight;
@@ -51,7 +42,6 @@ struct request {
   struct evhttp_uri *uri;
   const char *host;
   char *path;
-	struct header *headers;
 	char *remote_addr;
   ev_uint16_t remote_port;
   struct header_choice supported_encodings[MAX_ENCODINGS];
@@ -69,12 +59,11 @@ struct resource {
 
 struct response {
   int status;
-  char *etag;
+  char etag[11];
   off_t content_length;
   const char *content_type;
   const char *content_encoding;
   struct evbuffer *content;
-	struct header *extra_headers;
 };
 
 struct response *try_serving_from_cache(

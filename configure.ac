@@ -32,8 +32,6 @@ AS_IF([test "x$with_brotli" = "xyes"], [
 
 AC_HEADER_STDBOOL
 AC_CHECK_HEADERS([unistd.h])
-AC_CHECK_HEADERS([uthash.h])
-AC_CHECK_HEADERS([utarray.h])
 AC_CHECK_FUNCS([strerror])
 AC_CHECK_FUNCS([getcwd])
 AC_CHECK_FUNCS(

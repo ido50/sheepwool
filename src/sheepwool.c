@@ -23,13 +23,11 @@
 #include "config.h"
 
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <errno.h>
 #include <error.h>
 #include <event2/buffer.h>
 #include <event2/event.h>
 #include <event2/http.h>
-#include <event2/keyvalq_struct.h>
 #include <fcntl.h>
 #include <libconfig.h>
 #include <libgen.h>
@@ -47,8 +45,6 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
-#include <utarray.h>
-#include <uthash.h>
 #include <zlib.h>
 
 #include "cmdline.h"
@@ -75,15 +71,6 @@ static void free_request(struct evhttp_request *conn, void *arg) {
 		if (structs->req->path != NULL)
 			free(structs->req->path);
 
-		if (structs->req->headers != NULL) {
-			struct header *current_header, *tmp;
-
-			HASH_ITER(hh, structs->req->headers, current_header, tmp) {
-				HASH_DEL(structs->req->headers, current_header);
-				free(current_header);
-			}
-		}
-
 		if (structs->req->num_supported_encodings)
 			for (int i = 0; i < structs->req->num_supported_encodings - 1; i++)
 				pcre_free_substring(structs->req->supported_encodings[i].value);
@@ -98,8 +85,6 @@ static void free_request(struct evhttp_request *conn, void *arg) {
 	}
 
 	if (structs->resp != NULL) {
-		if (structs->resp->etag != NULL)
-			free(structs->resp->etag);
 		if (structs->resp->content != NULL)
 			evbuffer_free(structs->resp->content);
 		free(structs->resp);
@@ -260,7 +245,8 @@ static struct resource *locate_resource_in_fs(struct request *req, char *fullpat
 	return NULL;
 }
 
-static void write_access_log(struct request *req, struct response *resp) {
+static void write_access_log(struct evhttp_request *conn,
+                             struct request *req, struct response *resp) {
 	char date[max_date_size];
 	time_t now = time(NULL);
 	if (now != -1) {
@@ -274,13 +260,13 @@ static void write_access_log(struct request *req, struct response *resp) {
 	if (remote == NULL)
 		remote = "-";
 
-	struct header *refererp = NULL;
-	HASH_FIND_STR(req->headers, "referer", refererp);
-	const char *referer = refererp ? refererp->value : "";
+	struct evkeyvalq *headers = evhttp_request_get_input_headers(conn);
 
-	struct header *agentp = NULL;
-	HASH_FIND_STR(req->headers, "user-agent", agentp);
-	const char *user_agent = agentp ? agentp->value : "";
+	const char *referer = evhttp_find_header(headers, "Referer");
+	if (!referer) referer = "";
+
+	const char *user_agent = evhttp_find_header(headers, "User-Agent");
+	if (!user_agent) user_agent = "";
 
 	fprintf(stdout, "%s %s - - [%s] \"%s %s %s\" %d %ld \"%s\" \"%s\"\n",
 	        req->host,
@@ -301,26 +287,21 @@ static int compare_encodings(const void *a, const void *b) {
 	return (weight_a < weight_b) - (weight_a > weight_b);
 }
 
-static void parse_accept_encoding(struct request *req) {
+static void parse_accept_encoding(struct evhttp_request *conn,
+                                  struct request *req) {
 	const char *error;
 	int erroffset;
 	pcre *re = NULL;
 	int ovector[MAX_ENCODINGS+1];
-	const char* pattern = "([^,;\\s]+)\\s*(?:;\\s*q=([01]\\.\\d{0,3}|1\\.0{0,3}|0))?";
+	const char *pattern = "([^,;\\s]+)\\s*(?:;\\s*q=([01]\\.\\d{0,3}|1\\.0{0,3}|0))?";
 
-	struct header *param;
-	HASH_FIND_STR(req->headers, "accept-encoding", param);
-
-	if (
-		param == NULL ||
-		param->value == NULL ||
-		strcmp(param->value, "") == 0) {
-
+	const char *value = evhttp_find_header(evhttp_request_get_input_headers(conn), "Accept-Encoding");
+	if (value == NULL || strcmp(value, "") == 0) {
 		DEBUG_PRINT("Client does not accept any encoding\n");
 		goto cleanup;
 	}
 
-	DEBUG_PRINT("Accept-Encoding sent by client: %s\n", param->value);
+	DEBUG_PRINT("Accept-Encoding sent by client: %s\n", value);
 
 	// Compile the regex pattern
 	re = pcre_compile(pattern, 0, &error, &erroffset, NULL);
@@ -329,7 +310,7 @@ static void parse_accept_encoding(struct request *req) {
 		goto cleanup;
 	}
 
-	const char *subject = param->value;
+	const char *subject = value;
 	int subject_length = strlen(subject);
 	int start_offset = 0;
 
@@ -423,39 +404,15 @@ static struct request *init_request(struct evhttp_request *conn) {
 
 	evhttp_connection_get_peer(evhttp_request_get_connection(conn), &req->remote_addr, &req->remote_port);
 
-	req->headers = NULL;
 	req->delegate = NULL;
 	req->input = 0;
 
 	req->num_supported_encodings = 0;
 	memset(req->supported_encodings, 0, sizeof(req->supported_encodings));
 
-	// Parse request headers
-	struct evkeyvalq *headers = evhttp_request_get_input_headers(conn);
-	struct evkeyval *kv = headers->tqh_first;
-	while (kv) {
-		struct header *h = malloc(sizeof *h);
-		if (h == NULL) {
-			fprintf(stderr, "Failed allocating for input header: %s\n", strerror(errno));
-			return NULL;
-		}
-
-		int key_len = strlen(kv->key);
-
-		for (int i = 0; i < key_len; i++)
-			kv->key[i] = tolower(kv->key[i]);
-
-		h->key = kv->key;
-		h->value = kv->value;
-
-		HASH_ADD_STR(req->headers, key, h);
-
-		kv = kv->next.tqe_next;
-	}
-
 	// Parse the Accept-Encoding header so we know which compression algorithms
 	// the client supports
-	parse_accept_encoding(req);
+	parse_accept_encoding(conn, req);
 
 	return req;
 }
@@ -542,22 +499,15 @@ static void handle_req(struct evhttp_request *conn, void *arg) {
 	if (resp->content_encoding && strcmp(resp->content_encoding, "none") != 0)
 		evhttp_add_header(headers, "Content-Encoding", resp->content_encoding);
 
-	if (resp->etag)
+	if (strlen(resp->etag))
 		evhttp_add_header(headers, "ETag", resp->etag);
-
-	if (resp->extra_headers) {
-		struct header *current_header, *tmp;
-		HASH_ITER(hh, resp->extra_headers, current_header, tmp) {
-			evhttp_add_header(headers, current_header->key, current_header->value);
-		}
-	}
 
 	if (req->method == EVHTTP_REQ_HEAD && resp->content != NULL)
 		evbuffer_drain(resp->content, evbuffer_get_length(resp->content));
 
 	evhttp_send_reply(conn, resp->status, "OK", resp->content);
 
-	write_access_log(req, resp);
+	write_access_log(conn, req, resp);
 }
 
 static int sandbox(char *root) {

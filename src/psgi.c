@@ -26,7 +26,7 @@
 #include <errno.h>
 #include <event2/buffer.h>
 #include <event2/http.h>
-#include <uthash.h>
+#include <event2/keyvalq_struct.h>
 
 #include <EXTERN.h>
 #include <perl.h>
@@ -92,25 +92,23 @@ static HV* create_psgi_env(struct evhttp_request *conn, struct request *req) {
 	hv_stores(env, "QUERY_STRING", newSVpv(evhttp_uri_get_query(req->uri), 0));
 	hv_stores(env, "SERVER_PROTOCOL", newSVpv("1.1", 0));
 
-	bool is_https = false;
-
-	struct header *current_header, *tmp;
-	HASH_ITER(hh, req->headers, current_header, tmp) {
-		int len = 5 + strlen(current_header->key);
+	struct evkeyvalq *headers = evhttp_request_get_input_headers(conn);
+	struct evkeyval *kv = headers->tqh_first;
+	while (kv) {
+		int len = 5 + strlen(kv->key); // 5 for "HTTP_" prefix
 		char header[len+1];
-		psgi_header_name(header, current_header->key, len);
+		psgi_header_name(header, kv->key, len);
 
-		const char *val = current_header->value;
+		const char *val = kv->value;
 
 		hv_store(env, header, len, newSVpv(val, 0), 0);
 
-		if (strcmp(header, "HTTP_X_FORWARDED_PROTO") == 0)
-			if (strcmp(val, "https") == 0)
-				is_https = true;
-			else if (strcmp(header, "HTTP_CONTENT_TYPE") == 0)
-				hv_stores(env, "CONTENT_TYPE", newSVpv(val, 0));
-			else if (strcmp(header, "HTTP_CONTENT_LENGTH") == 0)
-				hv_stores(env, "CONTENT_LENGTH", newSVpv(val, 0));
+		if (strcmp(header, "HTTP_CONTENT_TYPE") == 0)
+			hv_stores(env, "CONTENT_TYPE", newSVpv(val, 0));
+		else if (strcmp(header, "HTTP_CONTENT_LENGTH") == 0)
+			hv_stores(env, "CONTENT_LENGTH", newSVpv(val, 0));
+
+		kv = kv->next.tqe_next;
 	}
 
 	AV *version = newAV();
@@ -118,7 +116,7 @@ static HV* create_psgi_env(struct evhttp_request *conn, struct request *req) {
 	av_push(version, newSViv(1));
 	hv_stores(env, "psgi.version", newRV_noinc((SV *) version));
 
-	hv_stores(env, "psgi.url_scheme", is_https ? newSVpv("https", 5) : newSVpv("http", 4));
+	hv_stores(env, "psgi.url_scheme", newSVpv(evhttp_uri_get_scheme(req->uri), 0));
 	hv_stores(env, "psgi.run_once", newSViv(0));
 	hv_stores(env, "psgi.streaming", newSViv(0));
 	hv_stores(env, "psgi.nonblocking", newSViv(1));
@@ -160,7 +158,7 @@ static SV* eval_psgi(
 
 	SV *err = ERRSV;
 	if (SvTRUE(err)) {
-		fprintf(stderr, "PSGI app %s failed: %s", script, SvPV_nolen(err));
+		fprintf(stderr, "PSGI app %s failed: %s", script, SvPV_nolen_const(err));
 		POPs;
 		goto cleanup;
 	}
@@ -217,18 +215,17 @@ struct response *serve_psgi(
 	AV *res_av = (AV *)SvRV(res_rv);
 
 	struct response *resp = malloc(sizeof *resp);
-	if (resp == NULL) {
+	if (!resp) {
 		fprintf(stderr, "Failed allocating for response: %s\n", strerror(errno));
 		goto cleanup;
 	}
 
 	resp->status = 0;
-	resp->etag = NULL;
+	resp->etag[0] = '\0';
 	resp->content_length = 0;
 	resp->content_type = NULL;
 	resp->content_encoding = NULL;
 	resp->content = NULL;
-	resp->extra_headers = NULL;
 
 	// Process response status
 	SV *status = (SV *) *(av_fetch(res_av, 0, 0));
@@ -245,21 +242,13 @@ struct response *serve_psgi(
 		if (key_sv == NULL || val_sv == NULL)
 			break;
 
-		struct header *h = malloc(sizeof *h);
-		if (h == NULL) {
-			fprintf(stderr, "Failed allocating for output header: %s\n", strerror(errno));
-			resp = NULL;
-			goto cleanup;
-		}
+		const char *header = SvPV_nolen_const(key_sv);
 
-		h->key = SvPV_nolen(key_sv);
-
-		if (strcmp(h->key, "Content-Type") == 0) {
-			resp->content_type = SvPV_nolen(val_sv);
-		} else {
-			h->value = SvPV_nolen(val_sv);
-			HASH_ADD_STR(resp->extra_headers, key, h);
-		}
+		if (strcmp(header, "Content-Type") == 0)
+			resp->content_type = SvPV_nolen_const(val_sv);
+		else
+			evhttp_add_header(
+				evhttp_request_get_output_headers(conn), header, SvPV_nolen_const(val_sv));
 
 		SvREFCNT_dec(key_sv);
 		SvREFCNT_dec(val_sv);

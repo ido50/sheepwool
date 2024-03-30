@@ -28,7 +28,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <uthash.h>
 
 #include "sheepwool.h"
 
@@ -51,12 +50,8 @@ struct response *serve_html(
 	}
 
 	char content_length[21];
-	struct header *header = malloc(sizeof *header);
-	header->key = "Content-Length";
 	snprintf(content_length, 21, "%ld", res->size);
-	header->value = content_length;
-
-	HASH_ADD_STR(req->headers, key, header);
+	evhttp_add_header(evhttp_request_get_input_headers(conn), "Content-Length", content_length);
 
 	req->input = fd;
 	req->delegate = srv_info->html_handler;

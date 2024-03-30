@@ -198,18 +198,17 @@ struct response *try_serving_from_cache(
 		return NULL;
 
 	struct response *resp = malloc(sizeof *resp);
-	if (resp == NULL) {
+	if (!resp) {
 		fprintf(stderr, "Failed allocating for response: %s\n", strerror(errno));
 		return NULL;
 	}
 
 	resp->status = HTTP_OK;
-	resp->etag = etag;
+	strncpy(resp->etag, etag, 11);
 	resp->content_length = 0;
 	resp->content_type = content_type;
 	resp->content_encoding = "none";
 	resp->content = NULL;
-	resp->extra_headers = NULL;
 
 	// Go over all supported encodings and check if a cached version exists for
 	// any of them

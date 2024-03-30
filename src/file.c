@@ -79,10 +79,9 @@ struct response *serve_file(struct server_info *srv_info,
 
 	resp->status = HTTP_OK;
 	resp->content_length = res->size;
-	resp->etag = NULL;
+	resp->etag[0] = '\0';
 	resp->content = NULL;
 	resp->content_encoding = "none";
-	resp->extra_headers = NULL;
 
 	resp->content_type =
 		has_suffix(res->fullpath, ".css") ? "text/css" :
@@ -118,7 +117,6 @@ struct response *serve_file(struct server_info *srv_info,
 			// Calcualte the file's ETag
 			uLong etag = calculate_etag(res, resp);
 			if (etag > 0) {
-				resp->etag = malloc(11);
 				sprintf(resp->etag, "\"%08lx\"", etag);
 				resp->etag[10] = '\0';
 				DEBUG_PRINT("Calculated etag: %s\n", resp->etag);

@@ -25,6 +25,7 @@
 #include <event2/buffer.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #if HAVE_BROTLI
@@ -130,7 +131,7 @@ static unsigned char *compress_deflate(
 	unsigned long buffer_size = compressBound(res->size);
 
 	unsigned char *content = malloc(buffer_size);
-	if (content == NULL) {
+	if (!content) {
 		fprintf(stderr, "Memory allocation failed for compressed content: %s\n", strerror(errno));
 		return NULL;
 	}
