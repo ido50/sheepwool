@@ -362,15 +362,35 @@ static bool should_ignore_path(struct server_info *srv_info, const char *path) {
 				ignored = false;
 			}
 		} else {
-			DEBUG_PRINT("CHECKING IF %s MATCHES %s\n", path+1, srv_info->ignores[i]);
 			if (fnmatch(srv_info->ignores[i], path+1, 0) == 0) {
-				DEBUG_PRINT("IT DOES!\n");
 				ignored = true;
 			}
 		}
 	}
 
 	return ignored;
+}
+
+static struct redirect *should_redirect_path(struct server_info *srv_info, const char *path) {
+	DEBUG_PRINT("Checking if %s should redirect...\n", path);
+
+	for (int i = 0; i < srv_info->num_redirects; i++) {
+		if (fnmatch(srv_info->redirects[i]->from, path, 0) == 0) {
+			struct redirect *red = malloc(sizeof *red);
+			if (!red) {
+				fprintf(stderr, "Failed allocating for redirect: %s\n", strerror(errno));
+				return NULL;
+			}
+
+			red->from = path;
+			red->to = srv_info->redirects[i]->to;
+			red->status = srv_info->redirects[i]->status;
+
+			return red;
+		}
+	}
+
+	return NULL;
 }
 
 static struct request *init_request(struct evhttp_request *conn) {
@@ -486,6 +506,16 @@ static void handle_req(struct evhttp_request *conn, void *arg) {
 		return;
 	}
 
+	struct redirect *red = should_redirect_path(srv_info, req->path);
+	if (red) {
+		struct evbuffer *buf = evbuffer_new();
+		evbuffer_add_printf(buf, "You are being redirected to %s\n", red->to);
+		evhttp_add_header(evhttp_request_get_output_headers(conn), "Location", red->to);
+		evhttp_add_header(evhttp_request_get_output_headers(conn), "Content-Type", "text/plain");
+		evhttp_send_reply(conn, red->status, 0, buf);
+		return;
+	}
+
 	res = locate_resource_in_fs(req, NULL, false);
 	if (res == NULL) {
 		evhttp_send_error(conn, HTTP_NOTFOUND, 0);
@@ -546,7 +576,7 @@ static void handle_req(struct evhttp_request *conn, void *arg) {
 	if (req->method == EVHTTP_REQ_HEAD && resp->content != NULL)
 		evbuffer_drain(resp->content, evbuffer_get_length(resp->content));
 
-	evhttp_send_reply(conn, resp->status, "OK", resp->content);
+	evhttp_send_reply(conn, resp->status, 0, resp->content);
 
 	write_access_log(conn, req, resp);
 }
@@ -602,7 +632,6 @@ static int load_config(struct server_info *srv_info) {
 	config_setting_t *ignore = config_lookup(&config, "ignore");
 	if (ignore != NULL) {
 		srv_info->num_ignores = config_setting_length(ignore);
-		DEBUG_PRINT("There are %d ignore settings\n", srv_info->num_ignores);
 
 		srv_info->ignores = calloc(srv_info->num_ignores, sizeof(char *));
 		if (srv_info->ignores == NULL) {
@@ -624,13 +653,44 @@ static int load_config(struct server_info *srv_info) {
 			} else {
 				srv_info->ignores[i] = strdup(pattern);
 			}
-			DEBUG_PRINT("Ignore %d = %s\n", i + 1, srv_info->ignores[i]);
 		}
 	}
 
 	const char *handler;
 	if (config_lookup_string(&config, "html_handler", &handler))
 		srv_info->html_handler = strdup(handler);
+
+	srv_info->redirects = NULL;
+	config_setting_t *redirect = config_lookup(&config, "redirect");
+	if (redirect != NULL) {
+		srv_info->num_redirects = config_setting_length(redirect);
+
+		srv_info->redirects = calloc(srv_info->num_redirects, sizeof(char *));
+		if (srv_info->redirects == NULL) {
+			fprintf(stderr, "Failed allocating memory for redirect array: %s\n", strerror(errno));
+			return 1;
+		}
+
+		for (int i = 0; i < srv_info->num_redirects; i++) {
+			config_setting_t *rule = config_setting_get_elem(redirect, i);
+			const char *from = config_setting_get_string_elem(rule, 0);
+			const char *to = config_setting_get_string_elem(rule, 1);
+			int status = config_setting_get_int_elem(rule, 2);
+			struct redirect *red = malloc(sizeof *red);
+			if (!red) {
+				fprintf(stderr, "Failed allocating memory for redirect rule: %s\n", strerror(errno));
+				return 1;
+			}
+
+			red->from = from;
+			red->to = to;
+			red->status = status;
+
+			DEBUG_PRINT("%s %d %s\n", from, status, to);
+
+			srv_info->redirects[i] = red;
+		}
+	}
 
 	return 0;
 }

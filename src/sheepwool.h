@@ -11,11 +11,19 @@
 #define DEBUG_PRINT(fmt, args ...)    /* Don't do anything in release builds */
 #endif
 
+struct redirect {
+  const char *from;
+  const char *to;
+  int status;
+};
+
 struct server_info {
 	magic_t magic_db;
+  char *html_handler;
   char **ignores;
   int num_ignores;
-  char *html_handler;
+  struct redirect **redirects;
+  int num_redirects;
 };
 
 enum param_type {
