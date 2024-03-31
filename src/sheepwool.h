@@ -13,7 +13,8 @@
 
 struct server_info {
 	magic_t magic_db;
-  char **ignore;
+  char **ignores;
+  int num_ignores;
   char *html_handler;
 };
 

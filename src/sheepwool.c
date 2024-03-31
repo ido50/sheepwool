@@ -29,6 +29,7 @@
 #include <event2/event.h>
 #include <event2/http.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <libconfig.h>
 #include <libgen.h>
 #include <magic.h>
@@ -183,12 +184,23 @@ static struct resource *locate_resource_in_fs(struct request *req, char *fullpat
 		}
 
 		// Try with .html
-		fullpath = realloc(fullpath, strlen(fullpath) + 5 + 1);
+		int newlen = strlen(fullpath) + 5 + 1;
+		fullpath = realloc(fullpath, newlen);
 		if (fullpath == NULL) {
 			fprintf(stderr, "Failed reallocing fullpath: %s\n", strerror(errno));
 			abort();
 		}
 		strcat(fullpath, ".html");
+		struct resource *html_file = locate_resource_in_fs(req, fullpath, true);
+		if (html_file != NULL)
+			return html_file;
+
+		// .html not found, try .psgi
+		fullpath[newlen - 5] = 'p';
+		fullpath[newlen - 4] = 's';
+		fullpath[newlen - 3] = 'g';
+		fullpath[newlen - 2] = 'i';
+
 		return locate_resource_in_fs(req, fullpath, true);
 	}
 
@@ -341,6 +353,26 @@ cleanup:
 	}
 }
 
+static bool should_ignore_path(struct server_info *srv_info, const char *path) {
+	bool ignored = false;
+
+	for (int i = 0; i < srv_info->num_ignores; i++) {
+		if (srv_info->ignores[i][0] == '!') {
+			if (fnmatch(srv_info->ignores[i] + 1, path+1, 0) == 0) {
+				ignored = false;
+			}
+		} else {
+			DEBUG_PRINT("CHECKING IF %s MATCHES %s\n", path+1, srv_info->ignores[i]);
+			if (fnmatch(srv_info->ignores[i], path+1, 0) == 0) {
+				DEBUG_PRINT("IT DOES!\n");
+				ignored = true;
+			}
+		}
+	}
+
+	return ignored;
+}
+
 static struct request *init_request(struct evhttp_request *conn) {
 	struct request *req = malloc(sizeof *req);
 	if (req == NULL) {
@@ -449,6 +481,11 @@ static void handle_req(struct evhttp_request *conn, void *arg) {
 		return;
 	}
 
+	if (should_ignore_path(srv_info, req->path)) {
+		evhttp_send_error(conn, HTTP_NOTFOUND, 0);
+		return;
+	}
+
 	res = locate_resource_in_fs(req, NULL, false);
 	if (res == NULL) {
 		evhttp_send_error(conn, HTTP_NOTFOUND, 0);
@@ -457,16 +494,20 @@ static void handle_req(struct evhttp_request *conn, void *arg) {
 
 	structs->res = res;
 
+	// Unsafe requests (e.g. POST, PUT, PATCH, DELETE...) are only allowed on
+	// PSGI resources. Static resources only support GET, HEAD and OPTIONS.
 	if (!req->is_safe && res->type != PSGI) {
 		evhttp_send_error(conn, HTTP_BADMETHOD, 0);
 		return;
 	}
 
-	// If request is safe, try serving it from cache.
+	// If this is a GET or HEAD request, try to serve it from cache, regardless
+	// of the kind of resource.
 	if (req->method == EVHTTP_REQ_GET || req->method == EVHTTP_REQ_HEAD)
 		resp = try_serving_from_cache(srv_info, conn, req, res);
 
-	// Serving from cache failed, let's serve the file based on its type.
+	// Serving from cache not possible or failed, let's serve the resource based on
+	// its type.
 	if (!resp) {
 		switch (res->type) {
 		case PSGI:
@@ -557,18 +598,34 @@ static int load_config(struct server_info *srv_info) {
 		return 1;
 	}
 
-	srv_info->ignore = NULL;
+	srv_info->ignores = NULL;
 	config_setting_t *ignore = config_lookup(&config, "ignore");
 	if (ignore != NULL) {
-		int count = config_setting_length(ignore);
-		srv_info->ignore = malloc(sizeof(char *)*count);
-		if (srv_info->ignore == NULL) {
+		srv_info->num_ignores = config_setting_length(ignore);
+		DEBUG_PRINT("There are %d ignore settings\n", srv_info->num_ignores);
+
+		srv_info->ignores = calloc(srv_info->num_ignores, sizeof(char *));
+		if (srv_info->ignores == NULL) {
 			fprintf(stderr, "Failed allocating memory for ignore array: %s\n", strerror(errno));
 			return 1;
 		}
 
-		for (int i = 0; i < count; i++)
-			srv_info->ignore[i] = strdup(config_setting_get_string_elem(ignore, i));
+		for (int i = 0; i < srv_info->num_ignores; i++) {
+			const char *pattern = config_setting_get_string_elem(ignore, i);
+			if (pattern[strlen(pattern)-1] == '/') {
+				int newlen = strlen(pattern)+2;
+				char *fixed_pattern = malloc(newlen);
+				if (!fixed_pattern) {
+					fprintf(stderr, "Failed allocating for pattern: %s\n", strerror(errno));
+					return 1;
+				}
+				snprintf(fixed_pattern, newlen, "%s*", pattern);
+				srv_info->ignores[i] = fixed_pattern;
+			} else {
+				srv_info->ignores[i] = strdup(pattern);
+			}
+			DEBUG_PRINT("Ignore %d = %s\n", i + 1, srv_info->ignores[i]);
+		}
 	}
 
 	const char *handler;
