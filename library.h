@@ -18,6 +18,7 @@
 #include <magic.h>
 #include <sqlite3.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <time.h>
 
 #define MAX_PARAMS 100
@@ -70,6 +71,7 @@ struct resource {
   char *ctime;
   char *mtime;
   char **tags;
+  FILE *fh;
 };
 
 void dumpstack(lua_State *L);
